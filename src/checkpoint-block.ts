@@ -10,35 +10,89 @@
  * @module dsh-agent-compact/checkpoint-block
  */
 
-/** 显式意图哨兵：必须独占一行且位于行首（防「文档/讨论里的模板」被误认）。 */
-export const CHECKPOINT_SENTINEL = '<!-- alice-compact -->'
-
 /** 块外壳（与既有 checkpoint 词汇一致，读侧工具无需改动）。 */
 export const CHECKPOINT_OPEN_TAG = '<compacted-summary>'
 export const CHECKPOINT_CLOSE_TAG = '</compacted-summary>'
 
 /**
- * 规定的 section 标题，**按序**全部出现才算合法 checkpoint。
+ * 一条 checkpoint 契约：哨兵、按序 section 清单、以及该契约自己的长度地板。
+ *
+ * 为什么要分契约而不是把中文标题并进同一张清单：`self` 与 `handoff` 是**两种互不
+ * 兼容的语义**——前者是有连续自我的 agent 按认知距离分层写下的自述（此刻 / 近來 /
+ * 回響 / 沉澱），后者是工具型 agent 的任务交接清单。若混成一张清单，一个只写了四格
+ * 中文自述的块会被「缺八节英文」拒掉，一个只写了八格英文交接的块也会被「缺四格中文」
+ * 拒掉；而若只查「至少命中某一套」，则两种半截块都能过关。⇒ 契约必须整体二选一。
+ */
+export interface CheckpointContract {
+  readonly id: 'self' | 'handoff'
+  readonly sentinel: string
+  readonly sections: readonly string[]
+  readonly minChars: number
+}
+
+/** 契约表（单一真源）：识别器只认这里列出的哨兵与 section 清单。 */
+export const CHECKPOINT_CONTRACTS: readonly CheckpointContract[] = [
+  {
+    id: 'self',
+    sentinel: '<!-- self-compact -->',
+    sections: ['## 此刻', '## 近來', '## 回響', '## 沉澱'],
+    minChars: 200,
+  },
+  {
+    id: 'handoff',
+    sentinel: '<!-- handoff-compact -->',
+    sections: [
+      '## Primary Request and Intent',
+      '## Key Technical Concepts',
+      '## Files and Code',
+      '## Errors and Fixes',
+      '## Pending Jobs',
+      '## Current Work',
+      '## Next Step',
+      '## Critical Context',
+    ],
+    minChars: 400,
+  },
+]
+
+/** handoff 契约：既有导出的兼容基线（值来自契约表，不另抄一份）。 */
+const HANDOFF_CONTRACT: CheckpointContract = CHECKPOINT_CONTRACTS.find(contract => contract.id === 'handoff')!
+
+/** 显式意图哨兵（handoff）：必须独占一行且位于行首（防「文档/讨论里的模板」被误认）。 */
+export const CHECKPOINT_SENTINEL = HANDOFF_CONTRACT.sentinel
+
+/** 全部契约哨兵（快筛用：任一出现才值得进入逐行识别）。 */
+export const CHECKPOINT_SENTINELS: readonly string[] = CHECKPOINT_CONTRACTS.map(contract => contract.sentinel)
+
+/**
+ * 规定的 section 标题（handoff），**按序**全部出现才算合法 checkpoint。
  *
  * 只查「在不在」会让半截模板（如我贴给主人看的三行示例）过关；查「按序全在」
  * 把误触发的形状从「像 checkpoint」收紧到「就是 checkpoint」。
  */
-export const CHECKPOINT_SECTIONS: readonly string[] = [
-  '## Primary Request and Intent',
-  '## Key Technical Concepts',
-  '## Files and Code',
-  '## Errors and Fixes',
-  '## Pending Jobs',
-  '## Current Work',
-  '## Next Step',
-  '## Critical Context',
-]
+export const CHECKPOINT_SECTIONS: readonly string[] = HANDOFF_CONTRACT.sections
 
-/** 识别结论：没这回事 / 有哨兵但不合法 / 合法且给出正文。 */
+/**
+ * 识别结论：没这回事 / 有哨兵但不合法 / 合法且给出正文。
+ *
+ * `contract` 是「这条块属于哪套契约」的显式标注：`valid` 必有；`invalid` 只在
+ * **已能判定契约**时带上（例如哨兵唯一但外壳缺失 / section 不全 / 长度不足）——
+ * 两条哨兵同时出现时无法判定，故不带；`absent` 永远不带。
+ */
 export type CheckpointBlock =
   | { readonly kind: 'absent' }
-  | { readonly kind: 'invalid'; readonly reason: string; readonly chars: number }
-  | { readonly kind: 'valid'; readonly body: string; readonly chars: number }
+  | {
+    readonly kind: 'invalid'
+    readonly reason: string
+    readonly chars: number
+    readonly contract?: CheckpointContract['id']
+  }
+  | {
+    readonly kind: 'valid'
+    readonly body: string
+    readonly chars: number
+    readonly contract: CheckpointContract['id']
+  }
 
 /**
  * 判断某个下标是否落在围栏代码块内（前面未闭合的 ``` 数量为奇数）。
@@ -69,15 +123,16 @@ export function isInsideFence(text: string, index: number): boolean {
  *
  * 只做**报告**，不改判据——命中与否仍以逐字匹配为准。
  * @param body - 外壳内的正文
+ * @param sections - 该契约要求的 section 标题（按序）
  * @returns 至多 3 条近似命中说明
  */
-function diagnoseMissingSections(body: string): string[] {
+function diagnoseMissingSections(body: string, sections: readonly string[]): string[] {
   const lines = body
     .split('\n')
     .map(line => line.trim())
     .filter(line => line !== '')
   const hints: string[] = []
-  for (const section of CHECKPOINT_SECTIONS) {
+  for (const section of sections) {
     const core = section.replace(/^#+\s*/, '')
     const near = lines.find(line => line.includes(core) && !line.startsWith(section))
     if (near !== undefined) {
@@ -137,39 +192,68 @@ export function diagnoseBestCandidate(body: string): { present: boolean; hint: s
 /**
  * 在一条助手消息的文本里识别 checkpoint 块。
  *
+ * 契约选择先于其余判据：**先确定这条块声明的是哪套契约**，再按该契约的 section
+ * 清单校验——否则两套契约的 section 会互相要求对方，谁都过不了。
+ *
  * 判据（**全部**满足才算合法，任一不满足即 `invalid` 并附原因——「响」而不是沉默）：
- * 1. 恰有一行以哨兵开头（行首，允许前导空白）
+ * 1. 恰有一行以某一契约的哨兵开头（行首，允许前导空白）
  * 2. 该哨兵不在围栏代码块内
  * 3. 哨兵之后（可隔空行）紧跟 `<compacted-summary>`
  * 4. 存在配对的 `</compacted-summary>`
- * 5. 正文长度 ≥ `minChars`
- * 6. 正文按序含全部 {@link CHECKPOINT_SECTIONS}
+ * 5. 正文长度 ≥ `Math.max(contract.minChars, minChars)`（全局下限只抬不降）
+ * 6. 正文按序含该契约的全部 `sections`
  *
  * @param text - 助手消息的全部文本块（已拼接）
- * @param minChars - 正文长度下限（碎片拒收地板）
+ * @param minChars - 全局长度下限：与契约自己的地板取较大者（配置只能收紧，不能放宽）
  * @returns 识别结论
  */
 export function parseCheckpointBlock(text: string, minChars: number): CheckpointBlock {
   const lines = text.split('\n')
-  const sentinels: number[] = []
+  const hits: { readonly contract: CheckpointContract; readonly line: number }[] = []
   for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index]!.trimStart().startsWith(CHECKPOINT_SENTINEL)) sentinels.push(index)
+    const trimmed = lines[index]!.trimStart()
+    for (const contract of CHECKPOINT_CONTRACTS) {
+      if (trimmed.startsWith(contract.sentinel)) hits.push({ contract, line: index })
+    }
   }
-  if (sentinels.length === 0) return { kind: 'absent' }
-  // 多处哨兵 = 意图不明（是要压哪一块？）⇒ 宁可判不合法，绝不猜
-  if (sentinels.length > 1) {
-    return { kind: 'invalid', reason: '哨兵出现 ' + String(sentinels.length) + ' 次（必须恰好一次）', chars: 0 }
+  if (hits.length === 0) return { kind: 'absent' }
+
+  // 两套契约的哨兵同时出现 = 连「这是哪种自述」都无法判定 ⇒ 绝不猜是哪一套
+  const contractIds = [...new Set(hits.map(hit => hit.contract.id))]
+  if (contractIds.length > 1) {
+    return {
+      kind: 'invalid',
+      reason: '同时出现多条契约哨兵，无法判定（' + contractIds.join(' / ') + '）',
+      chars: 0,
+    }
   }
-  const sentinelLine = sentinels[0]!
-  const sentinelOffset = text.split('\n').slice(0, sentinelLine).join('\n').length + (sentinelLine === 0 ? 0 : 1)
+
+  const contract = hits[0]!.contract
+  // 同一契约的哨兵出现多处 = 意图不明（是要压哪一块？）⇒ 宁可判不合法，绝不猜
+  if (hits.length > 1) {
+    return {
+      kind: 'invalid',
+      contract: contract.id,
+      reason: '哨兵出现 ' + String(hits.length) + ' 次（必须恰好一次）',
+      chars: 0,
+    }
+  }
+
+  const sentinelLine = hits[0]!.line
+  const sentinelOffset = lines.slice(0, sentinelLine).join('\n').length + (sentinelLine === 0 ? 0 : 1)
   if (isInsideFence(text, sentinelOffset)) {
-    return { kind: 'invalid', reason: '哨兵位于围栏代码块内（视为引用，不是压缩意图）', chars: 0 }
+    return {
+      kind: 'invalid',
+      contract: contract.id,
+      reason: '哨兵位于围栏代码块内（视为引用，不是压缩意图）',
+      chars: 0,
+    }
   }
 
   let cursor = sentinelLine + 1
   while (cursor < lines.length && lines[cursor]!.trim() === '') cursor += 1
   if (cursor >= lines.length || lines[cursor]!.trim() !== CHECKPOINT_OPEN_TAG) {
-    return { kind: 'invalid', reason: '哨兵后未紧跟 ' + CHECKPOINT_OPEN_TAG, chars: 0 }
+    return { kind: 'invalid', contract: contract.id, reason: '哨兵后未紧跟 ' + CHECKPOINT_OPEN_TAG, chars: 0 }
   }
 
   const bodyLines: string[] = []
@@ -181,20 +265,25 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
     }
     bodyLines.push(lines[index]!)
   }
-  if (!closed) return { kind: 'invalid', reason: '缺少配对的 ' + CHECKPOINT_CLOSE_TAG, chars: 0 }
+  if (!closed) {
+    return { kind: 'invalid', contract: contract.id, reason: '缺少配对的 ' + CHECKPOINT_CLOSE_TAG, chars: 0 }
+  }
 
   const body = bodyLines.join('\n').trim()
-  if (body.length < minChars) {
+  // 地板 = 两者取大：契约地板是硬下限，配置只能把它抬高，绝不能把它压下来
+  const floor = Math.max(contract.minChars, minChars)
+  if (body.length < floor) {
     return {
       kind: 'invalid',
-      reason: '正文 ' + String(body.length) + ' 字符 < 下限 ' + String(minChars) + '（碎片拒收）',
+      contract: contract.id,
+      reason: '正文 ' + String(body.length) + ' 字符 < 下限 ' + String(floor) + '（碎片拒收）',
       chars: body.length,
     }
   }
 
   const missing: string[] = []
   let scanFrom = 0
-  for (const section of CHECKPOINT_SECTIONS) {
+  for (const section of contract.sections) {
     const found = body.indexOf(section, scanFrom)
     if (found === -1) {
       missing.push(section)
@@ -203,16 +292,17 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
     scanFrom = found + section.length
   }
   if (missing.length > 0) {
-    const hints = diagnoseMissingSections(body)
+    const hints = diagnoseMissingSections(body, contract.sections)
     const suffix = hints.length === 0 ? '' : ' —— 近似命中：' + hints.join('；')
     return {
       kind: 'invalid',
+      contract: contract.id,
       reason: '缺少 section（按序查找未命中）：' + missing.join(' / ') + suffix,
       chars: body.length,
     }
   }
 
-  return { kind: 'valid', body, chars: body.length }
+  return { kind: 'valid', body, chars: body.length, contract: contract.id }
 }
 
 /**

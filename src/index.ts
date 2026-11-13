@@ -27,7 +27,7 @@ import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { createArchiveDispatcher } from './archive.ts'
-import { CHECKPOINT_SENTINEL, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
+import { CHECKPOINT_SENTINEL, CHECKPOINT_SENTINELS, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
 import type { CheckpointBlock } from './checkpoint-block.ts'
 import { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
 import { compactableHeadSeq, compactSurfaceRegion, inspectCompactionEntryState } from './region.ts'
@@ -234,7 +234,7 @@ export class AgentCompactEngine extends CompactionEngine {
       const data = event.data as { message?: { content?: unknown } } | undefined
       const text = assistantTextOf(data?.message?.content)
       // 快筛：没有哨兵就不是压缩意图——绝大多数消息在这里返回，零后续成本
-      if (!text.includes(CHECKPOINT_SENTINEL)) return
+      if (!CHECKPOINT_SENTINELS.some(s => text.includes(s))) return
       const parsed = parseCheckpointBlock(text, this.config.minCheckpointChars)
       if (parsed.kind === 'absent') return
       setImmediate(() => {

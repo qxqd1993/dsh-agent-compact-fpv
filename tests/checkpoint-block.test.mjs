@@ -24,9 +24,9 @@ import {
 
 const MIN = 200
 
-/** 规范正文：八个 section 各一行，凑够长度地板 */
+/** 规范正文：八个 section 各一行，凑够长度地板（handoff 契约地板已抬到 400） */
 const body = (extra = '') => CHECKPOINT_SECTIONS
-  .map((section, index) => section + '\n- ' + '第' + String(index) + '节内容' + 'x'.repeat(20))
+  .map((section, index) => section + '\n- ' + '第' + String(index) + '节内容' + 'x'.repeat(40))
   .join('\n\n') + (extra === '' ? '' : '\n\n' + extra)
 
 /** 规范块：哨兵 + 外壳 + 正文 */
@@ -121,14 +121,14 @@ describe('护栏三/四 · 外壳配对与长度地板', () => {
 
 describe('护栏五 · section 按序全在', () => {
   test('尸体样本：少一节 → invalid 并列出缺哪一节', () => {
-    const partial = CHECKPOINT_SECTIONS.slice(0, -1).map(s => s + '\n- ' + 'x'.repeat(30)).join('\n\n')
+    const partial = CHECKPOINT_SECTIONS.slice(0, -1).map(s => s + '\n- ' + 'x'.repeat(40)).join('\n\n')
     const parsed = parseCheckpointBlock(CHECKPOINT_SENTINEL + '\n' + formatCheckpointBlock(partial), MIN)
     assert.equal(parsed.kind, 'invalid')
     assert.match(parsed.reason, /## Critical Context/)
   })
 
   test('尸体样本：八节都在但顺序错乱 → invalid（只查「在不在」会放过它）', () => {
-    const shuffled = [...CHECKPOINT_SECTIONS].reverse().map(s => s + '\n- ' + 'x'.repeat(30)).join('\n\n')
+    const shuffled = [...CHECKPOINT_SECTIONS].reverse().map(s => s + '\n- ' + 'x'.repeat(40)).join('\n\n')
     const parsed = parseCheckpointBlock(CHECKPOINT_SENTINEL + '\n' + formatCheckpointBlock(shuffled), MIN)
     assert.equal(parsed.kind, 'invalid')
     assert.match(parsed.reason, /缺少 section/)
@@ -144,7 +144,7 @@ describe('护栏五 · section 按序全在', () => {
     // 事故原貌：`## 1 · Primary Request and Intent`——正文长度正常，8 节却全数未命中。
     const numbered = CHECKPOINT_SECTIONS
       .map((section, index) =>
-        '## ' + String(index + 1) + ' · ' + section.replace(/^#+\s*/, '') + '\n- ' + 'x'.repeat(30))
+        '## ' + String(index + 1) + ' · ' + section.replace(/^#+\s*/, '') + '\n- ' + 'x'.repeat(40))
       .join('\n\n')
     const parsed = parseCheckpointBlock(CHECKPOINT_SENTINEL + '\n' + formatCheckpointBlock(numbered), MIN)
     assert.equal(parsed.kind, 'invalid')
@@ -155,7 +155,7 @@ describe('护栏五 · section 按序全在', () => {
   test('对照组：真漏一节时不得报近似命中（证明该诊断有分辨力，不是恒亮）', () => {
     const partial = CHECKPOINT_SECTIONS
       .slice(0, -1)
-      .map(section => section + '\n- ' + 'x'.repeat(30))
+      .map(section => section + '\n- ' + 'x'.repeat(40))
       .join('\n\n')
     const parsed = parseCheckpointBlock(CHECKPOINT_SENTINEL + '\n' + formatCheckpointBlock(partial), MIN)
     assert.equal(parsed.kind, 'invalid')
