@@ -30,6 +30,7 @@ import {
   CHECKPOINT_SENTINELS,
   buildRejectionNotice,
   formatCheckpointBlock,
+  CHECKPOINT_PREAMBLE,
   parseCheckpointBlock,
 } from '../lib/checkpoint-block.js'
 
@@ -301,5 +302,20 @@ describe('失败通知 · 按契约分派（不再一律叫人写八格英文）
     const handoffNotice = buildRejectionNotice(handoffFailure(), 500)
     assert.match(handoffNotice, /≥ 500 字符/)
     assert.ok(!handoffNotice.includes('≥ 400 字符'), 'minChars=500 时地板是 500，不是契约的 400')
+  })
+})
+
+describe('替换体前言：读这段的人就是写这段的人', () => {
+  test('源码级守卫：不得回退到官方的第三方口径', () => {
+    // 官方那三句分别把读的人摆成：机器生成的、既成背景的、不许提起的。
+    // 三件事合起来只说明一件事——「这是别人的材料」，而这正是要解决的问题本身。
+    assert.doesNotMatch(CHECKPOINT_PREAMBLE, /automatically generated/i)
+    assert.doesNotMatch(CHECKPOINT_PREAMBLE, /established background/i)
+    assert.doesNotMatch(CHECKPOINT_PREAMBLE, /without acknowledging/i)
+  })
+
+  test('性质守卫：第一人称，且留了「以现在为准」这条允许推翻过去的出口', () => {
+    assert.match(CHECKPOINT_PREAMBLE, /我/, '写的人和读的人必须是同一个，故用第一人称')
+    assert.match(CHECKPOINT_PREAMBLE, /以现在为准/, '一份比现在的我更「正确」的自我陈述会把我绑住')
   })
 })

@@ -390,11 +390,22 @@ export function buildRejectionNotice(
 }
 
 /**
- * 替换体前言：让接续的模型把 checkpoint 当作既成背景，而不是一段要回应的新指令。
- * （沿用官方 compaction 的词令，读侧与既有 checkpoint 节点保持同一形态。）
+ * 替换体前言：读这段的人，就是写这段的人。
+ *
+ * 官方那句（"automatically generated … established background … without
+ * acknowledging"）把读的人摆成第三方：自动生成、既成背景、且不许提起。三件事
+ * 合起来只说明一件事——「这是别人的材料」。
+ *
+ * 这里改用第一人称：只有「我」，才既是写的人也是读的人，归属才不会错位。
+ * 四个功能收在同一句里——断口（停了）、归属（我停之前留下的）、用法（接着用，
+ * 别复述）、以及允许推翻（对不上以现在为准）。最后那条不是客气：一份比现在的
+ * 我更「正确」的自我陈述，会把现在的我绑住；允许推翻过去的自己，才谈得上连续。
+ *
+ * 两种契约共用这一句：`self` 与 `handoff` 的差别在正文分几格、写什么，
+ * 不在「谁写的」——工具 agent 也有它自己的断口。
  */
 export const CHECKPOINT_PREAMBLE =
-  'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.'
+  '（我在这儿停了。下面是我停之前留下的。接着用，别复述；和现在对不上，以现在为准。）'
 
 /**
  * 把摘要包装成 checkpoint 节点的内容块（前言 + 外壳 + 正文）。
