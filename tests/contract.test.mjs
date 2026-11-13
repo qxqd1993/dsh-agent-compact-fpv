@@ -14,8 +14,9 @@
  *      （`checkpoint-block.test.mjs`「围栏代码块内视为引用」）明确要求 `invalid`，
  *      且任务书同时禁止改动围栏排除的既有行为。这里按「不改既有行为」优先，
  *      固化 `invalid`——它同样是拒绝，只是会响一声。
- *   2) 只有围栏内哨兵时**不带 `contract` 字段**：连「这是哪种自述」都判不出来，
- *      标一个契约就是瞎猜（与多契约歧义同一口径）。
+ *   2) 只有围栏内哨兵时，**契约形态唯一才带 `contract`**：契约判得出就带上，
+ *      失败通知才能给出「按哪套写 + 移出围栏」的精确指引；两条哨兵都在围栏内
+ *      （真的判不出）才不带。
  *
  * 运行：npm test（先 build 再 node --test）
  */
@@ -86,7 +87,9 @@ describe('护栏二（不变）· 围栏内的哨兵不构成意图', () => {
     const parsed = parseCheckpointBlock(text, MIN)
     assert.equal(parsed.kind, 'invalid')
     assert.match(parsed.reason, /围栏/)
-    assert.equal('contract' in parsed, false, '只有围栏内哨兵 ⇒ 判不出契约，不得瞎标')
+    // 契约形态仍可判出时带上：失败通知才能说「按 self 写 + 移出围栏」，
+    // 而不是把精确诊断降级成含糊的二选一。
+    assert.equal(parsed.contract, 'self', '围栏内只有 self 哨兵 ⇒ 契约形态可判，应当标 self')
   })
 })
 

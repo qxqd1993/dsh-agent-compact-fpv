@@ -233,9 +233,13 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
   // 先剥围栏内的哨兵（引用），再用剩下的判契约：否则「贴模板 + 真写一块」被误判成歧义
   const outside = hits.filter(hit => !isInsideFence(text, hit.offset))
   if (outside.length === 0) {
-    // 只剩围栏内的哨兵 = 全程在引用范本，不是压缩意图。判不出契约，故不标 contract。
+    // 只剩围栏内的哨兵 = 全程在引用范本，不是压缩意图。**但契约形态仍可判出**：
+    // 一律回「二选一」等于把「你把块放进围栏了」这条精确诊断降级成含糊提示。
+    // 故仅在哨兵形态唯一时带上契约，失败通知才能说清「按哪套写 + 移出围栏」。
+    const fencedIds = [...new Set(hits.map(hit => hit.contract.id))]
     return {
       kind: 'invalid',
+      ...(fencedIds.length === 1 ? { contract: fencedIds[0]! } : {}),
       reason: '哨兵位于围栏代码块内（视为引用，不是压缩意图）',
       chars: 0,
     }
