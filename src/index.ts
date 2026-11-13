@@ -27,7 +27,7 @@ import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { createArchiveDispatcher } from './archive.ts'
-import { CHECKPOINT_SENTINEL, CHECKPOINT_SENTINELS, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
+import { CHECKPOINT_SENTINELS, buildRejectionNotice, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
 import type { CheckpointBlock } from './checkpoint-block.ts'
 import { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
 import { compactableHeadSeq, compactSurfaceRegion, inspectCompactionEntryState } from './region.ts'
@@ -45,13 +45,15 @@ declare module '@deepseek-ai/dsh-llm' {
 export { Config, DEFAULT_MIN_CHECKPOINT_CHARS, resolveConfig } from './config.ts'
 export type { CompactConfig, ResolvedCompactConfig } from './config.ts'
 export {
+  CHECKPOINT_CONTRACTS,
   CHECKPOINT_SECTIONS,
   CHECKPOINT_SENTINEL,
+  CHECKPOINT_SENTINELS,
   formatCheckpointBlock,
   isInsideFence,
   parseCheckpointBlock,
 } from './checkpoint-block.ts'
-export type { CheckpointBlock } from './checkpoint-block.ts'
+export type { CheckpointBlock, CheckpointContract } from './checkpoint-block.ts'
 export { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
 export type { MarkerSpan } from './marker.ts'
 
@@ -256,13 +258,7 @@ export class AgentCompactEngine extends CompactionEngine {
         chars: parsed.chars, error: parsed.reason,
       })
       // 「响」优先：写坏一块 checkpoint 不能静默——下个 step 我会看到原因并重写
-      this.notifyOnce(session, markerSeq, [
-        '⚠ 这次 checkpoint 未生效，会话历史**未改动**。',
-        '原因：' + parsed.reason,
-        '要压缩请重发一块：首行哨兵 `' + CHECKPOINT_SENTINEL + '`，紧跟 <compacted-summary> 外壳，',
-        '正文含全部 8 个 section（Primary Request and Intent … Critical Context），长度 ≥ '
-        + String(this.config.minCheckpointChars) + ' 字符，且不要放进围栏代码块。',
-      ].join('\n'))
+      this.notifyOnce(session, markerSeq, buildRejectionNotice(parsed, this.config.minCheckpointChars))
       return
     }
 

@@ -9,11 +9,13 @@
  * 与既有 `checkpoint-block.test.mjs` 的分工：那边守**五层护栏各自的形状**；
  * 这边只守**契约二选一**与**按契约校验**，同一份护栏逻辑不重复测。
  *
- * ⚠ 唯一与任务书不一致之处（有意为之，已在交付报告里说明）：
- *   任务书要求「哨兵在围栏内 → absent」，但 upstream 护栏二与既有测试
- *   （`checkpoint-block.test.mjs`「围栏代码块内视为引用」）明确要求 `invalid`，
- *   且任务书同时禁止改动围栏排除的既有行为。这里按「不改既有行为」优先，
- *   固化 `invalid`——它同样是拒绝，只是会响一声。
+ * ⚠ 与任务书的两处口径差异（有意为之，已在交付报告里说明）：
+ *   1) 任务书早先要求「哨兵在围栏内 → absent」，但 upstream 护栏二与既有测试
+ *      （`checkpoint-block.test.mjs`「围栏代码块内视为引用」）明确要求 `invalid`，
+ *      且任务书同时禁止改动围栏排除的既有行为。这里按「不改既有行为」优先，
+ *      固化 `invalid`——它同样是拒绝，只是会响一声。
+ *   2) 只有围栏内哨兵时**不带 `contract` 字段**：连「这是哪种自述」都判不出来，
+ *      标一个契约就是瞎猜（与多契约歧义同一口径）。
  *
  * 运行：npm test（先 build 再 node --test）
  */
@@ -25,6 +27,7 @@ import {
   CHECKPOINT_SECTIONS,
   CHECKPOINT_SENTINEL,
   CHECKPOINT_SENTINELS,
+  buildRejectionNotice,
   formatCheckpointBlock,
   parseCheckpointBlock,
 } from '../lib/checkpoint-block.js'
@@ -83,7 +86,7 @@ describe('护栏二（不变）· 围栏内的哨兵不构成意图', () => {
     const parsed = parseCheckpointBlock(text, MIN)
     assert.equal(parsed.kind, 'invalid')
     assert.match(parsed.reason, /围栏/)
-    assert.equal(parsed.contract, 'self', '已判定契约时 invalid 也要带上 contract')
+    assert.equal('contract' in parsed, false, '只有围栏内哨兵 ⇒ 判不出契约，不得瞎标')
   })
 })
 
@@ -201,5 +204,99 @@ describe('近似诊断 · 中文标题也适用', () => {
     assert.equal(parsed.kind, 'invalid')
     assert.match(parsed.reason, /近似命中/)
     assert.match(parsed.reason, /1\. 此刻/)
+  })
+})
+
+describe('围栏剔除先于契约判定（讨论契约本身是常态）', () => {
+  test('尸体样本：围栏内贴 self 模板 + 正文真写 handoff 块 → valid 且 contract === handoff', () => {
+    // 真实用法：先贴一段 self 范本讲清楚，再真写一个 handoff 块压缩。
+    // 若按「全部哨兵」判契约，两条哨兵同时出现 ⇒ 被误判成歧义拒收。
+    const text = '先贴一下 self 契约长什么样：\n\n```markdown\n'
+      + block(SELF_SENTINEL, selfBody())
+      + '\n```\n\n那我现在压一下：\n\n'
+      + block(HANDOFF_SENTINEL, handoffBody())
+    const parsed = parseCheckpointBlock(text, MIN)
+    assert.equal(parsed.kind, 'valid')
+    assert.equal(parsed.contract, 'handoff', '围栏内的 self 是引用，不得参与契约判定')
+    assert.ok(parsed.body.startsWith('## Primary Request and Intent'))
+  })
+
+  test('尸体样本：两条哨兵都只在围栏内 → invalid（围栏理由），且不带 contract', () => {
+    const text = '两套契约分别是：\n\n```markdown\n'
+      + block(SELF_SENTINEL, selfBody())
+      + '\n```\n\n```markdown\n'
+      + block(HANDOFF_SENTINEL, handoffBody())
+      + '\n```\n\n就这样。'
+    const parsed = parseCheckpointBlock(text, MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.match(parsed.reason, /围栏/)
+    assert.equal('contract' in parsed, false, '连哪种契约都判不出时，不得标 contract')
+  })
+
+  test('围栏内的 self 模板不得影响正文 handoff 的「恰好一次」计数', () => {
+    const text = '```\n' + block(SELF_SENTINEL, selfBody()) + '\n```\n\n'
+      + block(HANDOFF_SENTINEL, handoffBody()) + '\n\n'
+      + block(HANDOFF_SENTINEL, handoffBody())
+    const parsed = parseCheckpointBlock(text, MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.equal(parsed.contract, 'handoff')
+    assert.match(parsed.reason, /哨兵出现 2 次/)
+  })
+})
+
+describe('失败通知 · 按契约分派（不再一律叫人写八格英文）', () => {
+  /** self 失败：正文 199 字符（地板 200）⇒ invalid + contract self */
+  const selfFailure = () => parseCheckpointBlock(block(SELF_SENTINEL, selfBody(199)), MIN)
+  /** handoff 失败：正文 399 字符（地板 400）⇒ invalid + contract handoff */
+  const handoffFailure = () => parseCheckpointBlock(block(HANDOFF_SENTINEL, handoffBody(399)), MIN)
+  /** 歧义失败：两条哨兵都在围栏外 ⇒ invalid，无 contract */
+  const ambiguousFailure = () => parseCheckpointBlock(
+    block(SELF_SENTINEL, selfBody()) + '\n\n' + block(HANDOFF_SENTINEL, handoffBody()),
+    MIN,
+  )
+
+  test('self 失败 → 提示 self 哨兵与四格中文，不提 handoff', () => {
+    const parsed = selfFailure()
+    assert.equal(parsed.contract, 'self')
+    const notice = buildRejectionNotice(parsed, MIN)
+    assert.ok(notice.includes('<!-- self-compact -->'), '要能直接照抄 self 哨兵')
+    for (const section of ['此刻', '近來', '回響', '沉澱']) {
+      assert.ok(notice.includes(section), '缺 ' + section + ' 的写法提示')
+    }
+    assert.ok(!notice.includes('handoff-compact'), 'self 失败不得叫人去写 handoff')
+  })
+
+  test('handoff 失败 → 提示 handoff 哨兵与八格英文，不提 self', () => {
+    const parsed = handoffFailure()
+    assert.equal(parsed.contract, 'handoff')
+    const notice = buildRejectionNotice(parsed, MIN)
+    assert.ok(notice.includes('<!-- handoff-compact -->'), '要能直接照抄 handoff 哨兵')
+    assert.ok(notice.includes('Primary Request'), '八格英文清单要出现')
+    assert.ok(!notice.includes('self-compact'), 'handoff 失败不得叫人去写 self')
+  })
+
+  test('多契约歧义 → 两条哨兵都列出，让人自己选', () => {
+    const parsed = ambiguousFailure()
+    assert.equal(parsed.kind, 'invalid')
+    assert.equal('contract' in parsed, false)
+    const notice = buildRejectionNotice(parsed, MIN)
+    assert.ok(notice.includes('<!-- self-compact -->'), '两条哨兵都要给出来')
+    assert.ok(notice.includes('<!-- handoff-compact -->'))
+    assert.match(notice, /二选一/)
+  })
+
+  test('地板显示实际值：handoff + minChars=200 → 写 400（不是配置的 200）', () => {
+    const notice = buildRejectionNotice(handoffFailure(), MIN)
+    assert.match(notice, /≥ 400 字符/, '契约地板 400 必须压过配置下限 200')
+    assert.ok(!notice.includes('≥ 200 字符'), '不得把配置值当地板报出去')
+  })
+
+  test('地板显示实际值：minChars=500 → self 与 handoff 都写 500', () => {
+    const selfNotice = buildRejectionNotice(selfFailure(), 500)
+    assert.match(selfNotice, /≥ 500 字符/)
+    assert.ok(!selfNotice.includes('≥ 200 字符'))
+    const handoffNotice = buildRejectionNotice(handoffFailure(), 500)
+    assert.match(handoffNotice, /≥ 500 字符/)
+    assert.ok(!handoffNotice.includes('≥ 400 字符'), 'minChars=500 时地板是 500，不是契约的 400')
   })
 })

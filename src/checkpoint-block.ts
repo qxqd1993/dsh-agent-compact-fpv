@@ -195,6 +195,12 @@ export function diagnoseBestCandidate(body: string): { present: boolean; hint: s
  * 契约选择先于其余判据：**先确定这条块声明的是哪套契约**，再按该契约的 section
  * 清单校验——否则两套契约的 section 会互相要求对方，谁都过不了。
  *
+ * 围栏剔除先于契约判定：讨论契约本身就要贴模板（围栏内引用一条 self 范本、
+ * 正文里真写一个 handoff 块）是**常态**而不是歧义。若先按全部哨兵判契约，
+ * 这种消息会被当成「两条哨兵同时出现」直接拒收 ⇒ 必须先算出每条哨兵的原文偏移、
+ * 剥掉落在围栏内的，再用剩下的判契约与数量。只有围栏内哨兵时上游本就是 `invalid`，
+ * 故该顺序不改变任何既有护栏行为（哨兵行首 / 围栏排除 / 外壳配对 / 地板 / 按序 section）。
+ *
  * 判据（**全部**满足才算合法，任一不满足即 `invalid` 并附原因——「响」而不是沉默）：
  * 1. 恰有一行以某一契约的哨兵开头（行首，允许前导空白）
  * 2. 该哨兵不在围栏代码块内
@@ -209,17 +215,34 @@ export function diagnoseBestCandidate(body: string): { present: boolean; hint: s
  */
 export function parseCheckpointBlock(text: string, minChars: number): CheckpointBlock {
   const lines = text.split('\n')
-  const hits: { readonly contract: CheckpointContract; readonly line: number }[] = []
+  // 每条哨兵都带上它在**原文**里的偏移：围栏判定必须用原文，不能只按行号重算
+  const hits: { readonly contract: CheckpointContract; readonly line: number; readonly offset: number }[] = []
+  let lineOffset = 0
   for (let index = 0; index < lines.length; index += 1) {
-    const trimmed = lines[index]!.trimStart()
+    const lineText = lines[index]!
+    const trimmed = lineText.trimStart()
     for (const contract of CHECKPOINT_CONTRACTS) {
-      if (trimmed.startsWith(contract.sentinel)) hits.push({ contract, line: index })
+      if (trimmed.startsWith(contract.sentinel)) {
+        hits.push({ contract, line: index, offset: lineOffset })
+      }
     }
+    lineOffset += lineText.length + 1
   }
   if (hits.length === 0) return { kind: 'absent' }
 
+  // 先剥围栏内的哨兵（引用），再用剩下的判契约：否则「贴模板 + 真写一块」被误判成歧义
+  const outside = hits.filter(hit => !isInsideFence(text, hit.offset))
+  if (outside.length === 0) {
+    // 只剩围栏内的哨兵 = 全程在引用范本，不是压缩意图。判不出契约，故不标 contract。
+    return {
+      kind: 'invalid',
+      reason: '哨兵位于围栏代码块内（视为引用，不是压缩意图）',
+      chars: 0,
+    }
+  }
+
   // 两套契约的哨兵同时出现 = 连「这是哪种自述」都无法判定 ⇒ 绝不猜是哪一套
-  const contractIds = [...new Set(hits.map(hit => hit.contract.id))]
+  const contractIds = [...new Set(outside.map(hit => hit.contract.id))]
   if (contractIds.length > 1) {
     return {
       kind: 'invalid',
@@ -228,27 +251,18 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
     }
   }
 
-  const contract = hits[0]!.contract
+  const contract = outside[0]!.contract
   // 同一契约的哨兵出现多处 = 意图不明（是要压哪一块？）⇒ 宁可判不合法，绝不猜
-  if (hits.length > 1) {
+  if (outside.length > 1) {
     return {
       kind: 'invalid',
       contract: contract.id,
-      reason: '哨兵出现 ' + String(hits.length) + ' 次（必须恰好一次）',
+      reason: '哨兵出现 ' + String(outside.length) + ' 次（必须恰好一次）',
       chars: 0,
     }
   }
 
-  const sentinelLine = hits[0]!.line
-  const sentinelOffset = lines.slice(0, sentinelLine).join('\n').length + (sentinelLine === 0 ? 0 : 1)
-  if (isInsideFence(text, sentinelOffset)) {
-    return {
-      kind: 'invalid',
-      contract: contract.id,
-      reason: '哨兵位于围栏代码块内（视为引用，不是压缩意图）',
-      chars: 0,
-    }
-  }
+  const sentinelLine = outside[0]!.line
 
   let cursor = sentinelLine + 1
   while (cursor < lines.length && lines[cursor]!.trim() === '') cursor += 1
@@ -315,6 +329,60 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
  */
 export function formatCheckpointBlock(body: string): string {
   return CHECKPOINT_OPEN_TAG + '\n' + body.trim() + '\n' + CHECKPOINT_CLOSE_TAG
+}
+
+/**
+ * 一条契约的「怎么写才算数」摘要（单契约提示与歧义二选一共用）。
+ *
+ * 地板取 `Math.max(contract.minChars, minChars)` 的**实际值**：通知若照抄配置值，
+ * 配置低于契约地板时就会叫人写到 200 字符——而 handoff 的实际地板是 400。
+ * @param contract - 目标契约
+ * @param minChars - 全局长度下限
+ * @returns 一行提示（哨兵 + 按序 section 清单 + 实际地板）
+ */
+function contractPrompt(contract: CheckpointContract, minChars: number): string {
+  return '哨兵 `' + contract.sentinel + '`，正文按序含全部 ' + String(contract.sections.length)
+    + ' 个 section（' + contract.sections.join(' / ') + '），长度 ≥ '
+    + String(Math.max(contract.minChars, minChars)) + ' 字符'
+}
+
+/**
+ * 构造「这次 checkpoint 未生效」的可见通知（纯函数，便于离线断言文案）。
+ *
+ * 按 `parsed.contract` 分派：`self` 失败绝不能叫人补八格英文，`handoff` 失败也不能
+ * 叫人补四格中文——写错契约的正文再长也过不了另一套的 section 校验。判不出契约
+ * （两条哨兵同时出现）时**不替人挑**：并排列出两张写法，让人自己选。
+ *
+ * @param parsed - 识别结论（`absent` 之外：调用点是「有哨兵但不合法」）
+ * @param minChars - 配置的全局下限（只用于与契约地板取较大者）
+ * @returns 直接可投递的一则通知文本
+ */
+export function buildRejectionNotice(
+  parsed: Exclude<CheckpointBlock, { kind: 'absent' }>,
+  minChars: number,
+): string {
+  const reason = parsed.kind === 'invalid' ? parsed.reason : ''
+  const head = '⚠ 这次 checkpoint 未生效，会话历史**未改动**。'
+    + (reason === '' ? '' : '\n原因：' + reason)
+  const envelope = '哨兵后紧跟 <compacted-summary> 外壳，且不要放进围栏代码块。'
+
+  // 判不出契约：把两套契约的哨兵与写法并排列出，让人二选一（一块只写一条哨兵）
+  if (parsed.contract === undefined) {
+    return [
+      head,
+      '要压缩请**二选一**（一块里只写一条哨兵）：',
+      ...CHECKPOINT_CONTRACTS.map(contract => '- ' + contractPrompt(contract, minChars)),
+      envelope,
+    ].join('\n')
+  }
+
+  const contract = CHECKPOINT_CONTRACTS.find(item => item.id === parsed.contract)!
+  const kind = contract.id === 'self' ? 'self 契约（四格中文自述）' : 'handoff 契约（八格英文交接清单）'
+  return [
+    head,
+    '要压缩请重发一块 ' + kind + '：首行' + contractPrompt(contract, minChars) + '，',
+    envelope,
+  ].join('\n')
 }
 
 /**
