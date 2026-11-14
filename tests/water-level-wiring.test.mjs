@@ -44,7 +44,7 @@ function gaugeHarness(options = {}) {
   const listeners = new Map()
   let level = 0
   let capacity = options.capacity === undefined ? 1000 : options.capacity
-  const sendFails = options.sendFails === true
+  let sendFails = options.sendFails === true
 
   const session = {
     id: options.sessionId ?? 'session-gauge',
@@ -85,6 +85,8 @@ function gaugeHarness(options = {}) {
     session,
     setLevel(value) { level = value },
     setCapacity(value) { capacity = value },
+    /** 让后续的 send 成功/失败——用来证明「投递失败不吃档」。 */
+    setSendFails(value) { sendFails = value },
     /**
      * 走一次 pre-step，返回监听器给它的决定。
      * @returns {Promise<object>} `next()` 的决定（用来证明它确实放行了）。
@@ -150,6 +152,25 @@ describe('接线：agent/pre-step → 状态机 → 投递（桩上下文）', (
     const failed = traceLines('water-level-failed', 'failx')
     assert.equal(failed.length, 1)
     assert.match(String(failed[0].error), /send-failed/)
+  })
+
+  test('投递失败不吃档：恢复之后同一水位仍会重试', async () => {
+    const h = gaugeHarness({ sendFails: true, sessionId: 'session-retry' })
+    h.setLevel(68)
+    await h.step()
+    assert.equal(h.sends.length, 0, '第一次没送出去')
+
+    // 恢复投递能力，水位**不变**（仍在同一档）。
+    h.setSendFails(false)
+    await h.step()
+
+    assert.equal(
+      h.sends.length,
+      1,
+      '失败必须不推进状态：先推进再送，会把「没喊出来的提醒」记成「喊过了」，'
+      + '于是这个水位再也不出声——那比没有提醒更糟，因为它让人以为这里有人看着',
+    )
+    assert.equal(traceLines('water-level-failed', 'retry').length, 1, '失败留证只落一次，不刷屏')
   })
 
   test('60-64 只写 trace，不打扰（可见通道零消息）', async () => {

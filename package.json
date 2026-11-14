@@ -20,13 +20,11 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-agent": ">=0.1.0-rc.6",
-    "@deepseek-ai/dsh-compaction": ">=0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6",
     "@deepseek-ai/dsh-session": ">=0.1.0-rc.6",
     "@deepseek-ai/dsh-token-meter": ">=0.1.0-rc.6",
-    "@deepseek-ai/dsh-commands": ">=0.1.0-rc.6",
-    "@deepseek-ai/dsh-compaction-tool-result-pruner": ">=0.1.0-rc.6"
+    "@deepseek-ai/dsh-commands": ">=0.1.0-rc.6"
   },
+  "_comment_peerTrim": "2026-11-14（fork fish）删掉了 @deepseek-ai/dsh-compaction、dsh-llm、dsh-compaction-tool-result-pruner 三条 peer 声明。理由：这三样已经 vendor 化（见 src/vendor.ts）或只经 ctx.get 取用，运行期不再 import；而留在 peer 里会让 pnpm 尝试解析它们，registry 上的 dsh-compaction 停在 0.0.1-rc.5，不满足 >=0.1.0-rc.6 —— 那是下一个装不进去的原因。上游原版没有这三条问题，因为它本来就是从源码跑的。",
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsdown": "^0.22.14",

@@ -373,11 +373,15 @@ export class AgentCompactEngine {
     const waterLevel = (totalTokens / contextWindow) * 100
     const previous = this.gaugeStates.get(session) ?? INITIAL_GAUGE_STATE
     const decision = advanceGauge(waterLevel, previous)
-    this.gaugeStates.set(session, decision.state)
-    if (decision.kind === 'none') return
+    if (decision.kind === 'none') {
+      this.gaugeStates.set(session, decision.state)
+      return
+    }
 
     const rounded = Math.round(decision.waterLevel * 10) / 10
     if (decision.kind === 'trace') {
+      // trace 是「留痕」：写成功与否都推进。观测不得反噬，也不该让一次写盘失败
+      // 把同一个档位在每个 step 上反复重放。
       trace({
         phase: 'water-level',
         trigger: 'water-level',
@@ -387,10 +391,18 @@ export class AgentCompactEngine {
         stepSize: decision.stepSize,
         note: String(totalTokens) + '/' + String(contextWindow) + ' tok',
       })
+      this.gaugeStates.set(session, decision.state)
       return
     }
 
-    // 提醒档：状态机已把两个计数一起推到同档 ⇒ **不再补 trace**（一条通知足够）。
+    // 提醒档：**先送出去，再推进状态**。
+    //
+    // 反过来（先推进再送）有一个几乎不会被发现的坏处：送失败时那一档已经被记为
+    // 「提醒过了」，于是这个水位再也不出声。那不是省了一次噪音，是**把一次没喊
+    // 出来的提醒记成了喊过**——正好是这套机制最怕的失败形状：让我以为这里有人看着。
+    // 所以发送抛错时不推进，下个 step 重试。
+    //
+    // 状态机已把两个计数一起推到同档 ⇒ 提醒之后**不再补 trace**（一条通知足够）。
     try {
       agent.send(
         createUserMessage({
@@ -400,8 +412,9 @@ export class AgentCompactEngine {
         'next-step',
         false,
       )
+      this.gaugeStates.set(session, decision.state)
     } catch (error: unknown) {
-      // 提醒投递失败：留证，但绝不因为「喊不出来」而中断会话。
+      // 提醒投递失败：留证，停在原档，绝不因为「喊不出来」而中断会话。
       trace({
         phase: 'water-level-failed',
         session: sessionTagOf(session),
