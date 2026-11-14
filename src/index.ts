@@ -158,6 +158,9 @@ export class AgentCompactEngine {
   /** 已经为「分母未知」记过一笔的会话（每一步都记会刷屏，只记首次）。 */
   private readonly gaugeUnavailableReported = new WeakSet<object>()
 
+  /** 已经为「水位基线」记过一笔的会话（见 observeWaterLevel 里的基线说明）。 */
+  private readonly gaugeBaselineReported = new WeakSet<object>()
+
   constructor(ctx: Context, config: CompactConfig = {}) {
     this.ctx = ctx
     this.config = resolveConfig(config)
@@ -389,6 +392,26 @@ export class AgentCompactEngine {
 
     const { totalTokens } = this.ctx.tokenMeter.measure(session)
     const waterLevel = (totalTokens / contextWindow) * 100
+
+    // 水位基线：每个会话第一次算出百分比时记一行，无论高低。
+    //
+    // 60 以下本应「安静」，但安静不该等于「不可观测」。2026-11-14 实况：一个会话
+    // 压完之后想知道自己当时多少，trace 里什么都没有——因为水位没到 60，而 60 以下
+    // 一行都不写。结果「安静」变成了「查不到」，和漏哨兵那次是同一种失败：
+    // 想要的东西没留下任何可查的痕迹。
+    //
+    // 只记首次，不刷屏。
+    if (!this.gaugeBaselineReported.has(session)) {
+      this.gaugeBaselineReported.add(session)
+      trace({
+        phase: 'water-level-baseline',
+        trigger: 'water-level',
+        session: sessionTagOf(session),
+        waterLevel: Math.round(waterLevel * 10) / 10,
+        note: String(totalTokens) + '/' + String(contextWindow) + ' tok',
+      })
+    }
+
     const previous = this.gaugeStates.get(session) ?? INITIAL_GAUGE_STATE
     const decision = advanceGauge(waterLevel, previous)
     if (decision.kind === 'none') {

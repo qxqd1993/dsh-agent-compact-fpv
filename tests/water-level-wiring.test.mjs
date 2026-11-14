@@ -235,3 +235,30 @@ describe('疑似块：标签在、哨兵缺——留痕，但不打扰', () => {
     assert.equal(traceLines('suspect', 'plain').length, 0)
   })
 })
+
+describe('水位基线：安静不等于不可观测', () => {
+  test('60 以下也记一行基线，且只记一次', async () => {
+    // 2026-11-14 实况：一个会话压完之后想知道自己当时多少，trace 里什么都没有，
+    // 因为水位没到 60、60 以下一行都不写。「安静」被实现成了「查不到」。
+    const h = gaugeHarness({ sessionId: 'session-base' })
+    h.setLevel(32)
+    await h.step()
+    await h.step()
+    await h.step()
+
+    const lines = traceLines('water-level-baseline', 'base')
+    assert.equal(lines.length, 1, '每个会话只记首次，不刷屏')
+    assert.equal(lines[0].waterLevel, 32, '要能回答「当时到底多少」')
+    assert.equal(h.sends.length, 0, '记基线不得变成打扰')
+  })
+
+  test('基线之后 60 以下仍然沉默（不因为记了基线就开始刷）', async () => {
+    const h = gaugeHarness({ sessionId: 'session-base2' })
+    h.setLevel(35)
+    await h.step()
+    h.setLevel(40)
+    await h.step()
+    assert.equal(traceLines('water-level', 'base2').length, 0, '60 以下不写常规水位行')
+    assert.equal(traceLines('water-level-baseline', 'base2').length, 1)
+  })
+})
