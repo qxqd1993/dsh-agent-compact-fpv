@@ -37,6 +37,8 @@ import { CHECKPOINT_CLOSE_TAG, CHECKPOINT_OPEN_TAG, CHECKPOINT_SENTINELS, buildR
 import type { CheckpointBlock } from './checkpoint-block.ts'
 import { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
 import { compactableHeadSeq, compactSurfaceRegion, inspectCompactionEntryState } from './region.ts'
+import { pruneBeforeCompaction as pruneToolResults } from './prune.ts'
+import type { PruneSessionView } from './prune.ts'
 import { Config, resolveConfig } from './config.ts'
 import type { CompactConfig, ResolvedCompactConfig } from './config.ts'
 import { sessionTagOf, trace } from './trace.ts'
@@ -611,37 +613,23 @@ export class AgentCompactEngine {
    * checkpoint——让一次**可选**的裁剪失败去丢掉一次压缩请求，是用优化换主功能。
    * 故这里只如实记账（`prune-skipped` / `prune-failed`），主事务照走：裁剪本身对每个
    * 节点是「append + replace」同步原子落盘，失败也留得下一致的表层。
+   *
+   * **回合关闭时整个跳过**（2026-11-15 事故后加的闸，见函数内注释）：剪枝替身是非 append
+   * 的 `tool/result`，宿主读侧要求它落在打开的回合里，写下去日志就再也打不开。这不是一项
+   * 优化，是本引擎里唯一一条「必须在写之前拦住」的约束——其余都只是记账。
    * @param session - 要压缩的会话（剪枝直接改它的表层）。
    * @param trigger - 本次压缩的入口（记账用）。
    */
   private pruneBeforeCompaction(session: Session, trigger: 'marker' | 'tool'): void {
     const pruner = this.ctx.get('toolResultPruner') as ToolResultPrunerFacade | undefined
-    if (pruner === undefined) {
-      trace({
-        phase: 'prune-skipped',
-        trigger,
-        session: sessionTagOf(session),
-        note: 'toolResultPruner 服务不在本组合（未挂载 dsh-compaction-tool-result-pruner？）',
-      })
-      return
-    }
-    try {
-      const result = pruner.pruneSession(session)
-      if (result.pruned.length === 0) return
-      trace({
-        phase: 'pruned',
-        trigger,
-        session: sessionTagOf(session),
-        note: '裁掉 ' + String(result.pruned.length) + ' 条工具结果，省 ' + String(result.charsRemoved) + ' 字符',
-      })
-    } catch (error: unknown) {
-      trace({
-        phase: 'prune-failed',
-        trigger,
-        session: sessionTagOf(session),
-        error: errorChain(error),
-      })
-    }
+    // 判据与闸都在 `prune.ts`（2026-11-15 事故后挪出去，为了能离线咬住）：这里只负责
+    // 取服务、把宿主 Session 递给它。剪枝替身是非 append 的 tool/result，宿主读侧要求它
+    // 落在打开的回合里——回合关着时那一条都写不得，见 `prune.ts` 里的事故记录。
+    pruneToolResults(
+      session as unknown as PruneSessionView,
+      trigger,
+      pruner === undefined ? undefined : (view) => pruner.pruneSession(view as unknown as Session),
+    )
   }
 
   /**

@@ -128,6 +128,7 @@
 | 宿主事件 | `src/index.ts:registerMarkerPath` → `ctx.on('session/event')` | 每条 `assistant/message` 落盘后 |
 | 工具面 | `dsh-compact-provider:src/index.ts` → `engine.compactWithSummary` | `session_compact` 被调用 |
 | 引擎自身 | `src/index.ts:commit` → `compactSurfaceRegion` | 两条入口共用的唯一事务 |
+| 引擎自身 | `src/index.ts:pruneBeforeCompaction` → `src/prune.ts` | 两条入口在取区间**之前**；**回合关闭时整支跳过**（见 §9 · 2026-11-15） |
 | 宿主 seam | `src/index.ts:compactIfNeeded` | 恒 `null`（无自动路径）；`compactNow`/`compactRegion` 恒抛 |
 
 ### 4.5 侧车轨迹 `[MUST]`（`<DSH_HOME>/compaction-trace.jsonl`）
@@ -143,6 +144,9 @@
 | 缺省 | `archive-dispatched` | 压缩前存档**已派发**（非阻塞、立即返回；`src/archive.ts`） |
 | 缺省 | `archive-settled` | 存档落定：`ok` / `durationMs`（真耗时）/ 失败时 `error` |
 | 缺省 | `archive-skipped` | 单飞命中（上一次未落定，`note` 带连续计数）或 checkpoint 服务不在本组合 |
+| 缺省 | `pruned` | 压缩前剪枝成功（`note` 给条数与省下的字符数） |
+| 缺省 | `prune-skipped` | **没剪**：服务不在本组合 / **回合已关闭**（`note` 写明宿主判据）/ 没有可剪的节点不留行 |
+| 缺省 | `prune-failed` | 剪枝自己抛（`error` 给原因）；主事务照走 |
 | `provider` | `requested`/`rejected`/`completed`/`failed` | 工具入口侧四阶段 |
 
 **断点即最后一条非终态阶段**。`build` 字段自证「线上跑的是哪个构建」（版本段取自随源码走的 `VERSION` 常量，不信消费方副本的陈旧 `package.json`）。
@@ -313,9 +317,30 @@
   - **顺带一条环境实测（反例）**：本次压缩**没有**重置文件观测——紧随其后的两次 `edit`
     未撞 `file has not been read`（与「重启会重置观测」形成对照，见上一段 0.2.1 条目）。
     压缩改的是**上下文**，不是**进程**，故观测守卫的会话记录不受影响。
+- **2026-11-15 一条可能性把会话文档写死：剪枝替身的回合位置（不是它「压坏了历史」）**
+  - **事故形状**：同一次检查点之后分叉出去的那条分支多走了六轮，退出宿主容器再进来时会话
+    打不开：`stored session "…99843920…" is corrupt: SessionFormatError: tool/result is
+    outside an open turn`。它没有写坏任何历史——它写坏的是**读得回来**这件事。
+  - **根因在读侧，不在事务里**：读取器的 event walk 对 `tool/result` 分两支——`surfaceOp
+    === 'append'` 要求 `openStep` 并查 callId 生命周期；**非 append（即替换体）只要求
+    `openTurn !== null`**，否则整份日志拒收。剪枝替身正是非 append 的 `tool/result`。
+    标记路径的监听器若在 `turn/end` 之后才跑到，`pruneBeforeCompaction` 照样调服务，
+    替身就落在回合外：那一支写了 15 条，日志从此打不开。
+  - **为什么本会话活着**：同一时刻 `pruner.pruneSession` 返回 `pruned.length === 0`
+    （无可剪），一条都没写。**差别是运气，不是设计。**
+  - **修法：闸落在写之前**。`src/prune.ts` 里 `inspectCompactionEntryState(...).openTurn
+    === null` ⇒ 整支跳过并记 `prune-skipped`（note 写明宿主那条判据）。判据复用
+    `region.ts` 同一份入口状态扫描，**不另写一份回合状态机**（§9 上文那条「两份实现必然漂移」）。
+  - **为什么它必须是闸而不是回执**：拒绝发生在**下一次加载**——那时谁都救不回来，所以
+    「事后对账」在这里等于没有。观测不反噬主流程这条仍然成立（压缩照常提交）；但
+    **「写下去就再也读不回来」的改动不是观测**。这是本引擎唯一一条必须在写之前拦的约束。
+  - **代价（如实记）**：`/compact` 命令路径的命令在回合外执行 ⇒ 那条路径现在恒跳过剪枝，
+    剪枝只在标记路径生效。可接受：标记路径才是主入口，且剪枝本来就是可选优化。
+  - **守卫**：`tests/prune-gate.test.mjs` 五条。尸体对照是第一条——若实现退回「不看回合
+    状态直接剪」，pruner 会被调用，必红。**诚实边界**：它不跑真实宿主读取器，也不验
+    「写下去日志真的坏了」（那一点由事故本身提供）；被验的是「回合关着时本引擎会不会仍然去写」。
 
 ## 10 · 未决问题
-
 - **U1** ~~`setImmediate` 提交的两条时序~~ **已结案（2026-09-27）**：回合间（首笔：`turn/end` →
   `compaction/start` → `compaction/end` → 下一 `turn/start`，`turn: null` 被读侧接受）与
   **回合内**（第二笔：块与工具调用同轮发出，压缩在未闭合的回合里提交成功）**两条均已实测**
