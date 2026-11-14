@@ -54,6 +54,9 @@ export type TracePhase =
   | 'pruned'
   | 'prune-skipped'
   | 'prune-failed'
+  | 'water-level'
+  | 'water-level-skipped'
+  | 'water-level-failed'
   | 'archive-dispatched'
   | 'archive-settled'
   | 'archive-skipped'
@@ -119,6 +122,18 @@ export interface TraceEntry {
    * 差额原先无法归因（硬编码占位让侧车说不出话）。现按阶段分解，回答 §5.22 五问之⑤。
    */
   totalMs?: number
+  /**
+   * 上下文水位百分比（`water-level` 行，一位小数）。
+   *
+   * 为什么落到侧车：提醒是**有状态的**（同一档只喊一次、跌回 60 以下重置）。
+   * 只有把每档的水位记下来，「为什么这次没提醒 / 为什么又提醒了」才能从轨迹上答出来，
+   * 而不是靠人回忆上一步发生了什么。
+   */
+  waterLevel?: number
+  /** 水位档位（`water-level` 行）：向下取整到档距的整数倍。 */
+  bucket?: number
+  /** 本次档距（`water-level` 行）：1 = 红线档（≥75%），2 = 温和档。 */
+  stepSize?: number
   /** 捕获到的 checkpoint 字符数（captured）。 */
   chars?: number
   /** 捕获文本是否含 `<compacted-summary>` 标记（captured）。 */
@@ -196,6 +211,9 @@ export function serializeTraceEntry(entry: TraceEntry): string {
     ...(entry.durationMs !== undefined ? { durationMs: entry.durationMs } : {}),
     ...(entry.txnMs !== undefined ? { txnMs: entry.txnMs } : {}),
     ...(entry.totalMs !== undefined ? { totalMs: entry.totalMs } : {}),
+    ...(entry.waterLevel !== undefined ? { waterLevel: entry.waterLevel } : {}),
+    ...(entry.bucket !== undefined ? { bucket: entry.bucket } : {}),
+    ...(entry.stepSize !== undefined ? { stepSize: entry.stepSize } : {}),
     ...(entry.chars !== undefined ? { chars: entry.chars } : {}),
     ...(entry.markerOk !== undefined ? { markerOk: entry.markerOk } : {}),
     ...(entry.bestCandidate !== undefined ? { bestCandidate: entry.bestCandidate } : {}),

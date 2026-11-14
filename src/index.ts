@@ -10,7 +10,9 @@
  * 它们不是被修好，是被**删掉**。成本同时少一笔全上下文请求（实测意图请求 563k tok）。
  *
  * 框架自动压缩**不存在**：`compactIfNeeded` 恒返回 null，引擎不注册任何 pressure /
- * overflow 监听（AGENTS.md §2.4「禁止框架自动压缩」）。压缩只由 agent 说了算。
+ * overflow **压缩**监听（AGENTS.md §2.4「禁止框架自动压缩」）。压缩只由 agent 说了算。
+ * 唯一挂在 `agent/pre-step` 上的监听器是**水位提醒**（只告知、绝不压缩，见
+ * `water-level.ts`）——框架可以提醒，但不能代劳。
  *
  * 事件序列与官方 compaction 事务**字节兼容**（`compaction/start` → `compaction/summary`
  * → `user/message` 三键 replace → `compaction/end`），且闭合在提交那一刻的回合内
@@ -39,6 +41,15 @@ import { Config, resolveConfig } from './config.ts'
 import type { CompactConfig, ResolvedCompactConfig } from './config.ts'
 import { sessionTagOf, trace } from './trace.ts'
 import { VERSION } from './version.ts'
+import {
+  INITIAL_GAUGE_STATE,
+  WARN_HARD,
+  WARN_HIGH,
+  WARN_LOW,
+  advanceGauge,
+  buildWaterLevelNotice,
+} from './water-level.ts'
+import type { GaugeState } from './water-level.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -136,6 +147,17 @@ export class AgentCompactEngine {
    */
   private readonly archiveDispatch: (trigger: string) => void
 
+  /**
+   * 每个会话的水位状态机状态（WeakMap：会话被回收即释放）。
+   *
+   * 两个桶（trace / notice）分开存档——共用的话，60 写了 trace 就会吃掉 65 的提醒
+   * （细节与重置语义见 `water-level.ts` 顶部）。
+   */
+  private readonly gaugeStates = new WeakMap<object, GaugeState>()
+
+  /** 已经为「分母未知」记过一笔的会话（每一步都记会刷屏，只记首次）。 */
+  private readonly gaugeUnavailableReported = new WeakSet<object>()
+
   constructor(ctx: Context, config: CompactConfig = {}) {
     this.ctx = ctx
     this.config = resolveConfig(config)
@@ -167,7 +189,12 @@ export class AgentCompactEngine {
         this.ctx.logger.warn(message)
       },
     })
-    if (this.config.enabled) this.registerMarkerPath()
+    // 水位提醒也只在标记路径开启时注册：提醒里给的出路之一是「写一块 checkpoint」，
+    // 而标记路径关着时那块 checkpoint 不会生效——说了做不到，比不说更糟。
+    if (this.config.enabled) {
+      this.registerMarkerPath()
+      this.registerWaterLevelGauge()
+    }
   }
 
   /**
@@ -283,6 +310,105 @@ export class AgentCompactEngine {
         void this.handleMarker(session as unknown as SessionView, event.seq, parsed)
       })
     })
+  }
+
+  /**
+   * 注册水位提醒：每个 step 算一次上下文水位，过水位就按状态机出声，然后**停住**。
+   *
+   * 为什么挂在 `agent/pre-step`：这是官方 `compaction-basic` 做压力检查的同一时机
+   * （它的 `_registerAutomaticCompaction` 里那个监听器）。差别只有一件事：它在这一步
+   * **压缩**，我们只**提醒**——「框架可以提醒，但不能代劳」。
+   *
+   * 监听器绝不拦 step：任何异常都只落一笔 `water-level-failed`，然后照常 `next()`。
+   */
+  private registerWaterLevelGauge(): void {
+    this.ctx.on('agent/pre-step', ({ agent }, next) => {
+      try {
+        this.observeWaterLevel(agent)
+      } catch (error: unknown) {
+        // 观测不得反噬：提醒链路的异常只能记账，不能把这一步拦下来。
+        trace({
+          phase: 'water-level-failed',
+          session: sessionTagOf(agent.session),
+          error: errorChain(error),
+        })
+      }
+      return next()
+    })
+  }
+
+  /**
+   * 一个 step 的水位观测：算百分比 → 推状态机 → 写 trace 或注入告知。
+   *
+   * 分子用 `tokenMeter.measure(...).totalTokens`（与 compaction-basic 的阈值判据同源：
+   * 下一次请求的估计压力）；分母用 `tokenMeter.contextPressure(...).contextWindow`
+   * （最近一次请求记录下来的窗口容量）。为什么分子不取 `projectedTokens`：服务上的
+   * `contextPressure()` 只暴露 `pressureTokens` / `contextWindow`，不暴露它。
+   * 为什么分母不用 `llm.resolveModelInfo`：那要多注入一个 `llm` 服务、每步 await 一次
+   * 模型元数据；而这两个数宿主已经算好并缓存在会话投影里（状态栏用的也是它们）。
+   *
+   * 代价写清楚：**分母是 last-wins**——换模型后要等下一次请求才更新，这一步的水位
+   * 可能短暂地按旧窗口算。水位本来就是代理指标（见 `water-level.ts` 顶部），
+   * 这一点误差不影响「该不该出声」的判据。
+   * @param agent - 即将进入下一个 step 的 agent。
+   */
+  private observeWaterLevel(agent: Agent): void {
+    const session = agent.session
+    const { contextWindow } = this.ctx.tokenMeter.contextPressure(session)
+    if (contextWindow === undefined || !Number.isSafeInteger(contextWindow) || contextWindow <= 0) {
+      // 分母未知（会话还没有 request/context 记录）：算不出百分比。
+      // 不静默——每个会话只记一笔，说明「这段水位里压力计是瞎的」。
+      if (!this.gaugeUnavailableReported.has(session)) {
+        this.gaugeUnavailableReported.add(session)
+        trace({
+          phase: 'water-level-skipped',
+          session: sessionTagOf(session),
+          note: 'contextWindow 未知（尚无 request/context 记录），本会话的水位提醒暂不可用',
+        })
+      }
+      return
+    }
+
+    const { totalTokens } = this.ctx.tokenMeter.measure(session)
+    const waterLevel = (totalTokens / contextWindow) * 100
+    const previous = this.gaugeStates.get(session) ?? INITIAL_GAUGE_STATE
+    const decision = advanceGauge(waterLevel, previous)
+    this.gaugeStates.set(session, decision.state)
+    if (decision.kind === 'none') return
+
+    const rounded = Math.round(decision.waterLevel * 10) / 10
+    if (decision.kind === 'trace') {
+      trace({
+        phase: 'water-level',
+        trigger: 'water-level',
+        session: sessionTagOf(session),
+        waterLevel: rounded,
+        bucket: decision.bucket,
+        stepSize: decision.stepSize,
+        note: String(totalTokens) + '/' + String(contextWindow) + ' tok',
+      })
+      return
+    }
+
+    // 提醒档：状态机已把两个计数一起推到同档 ⇒ **不再补 trace**（一条通知足够）。
+    try {
+      agent.send(
+        createUserMessage({
+          content: [{ type: 'text', text: buildWaterLevelNotice(decision.waterLevel) }],
+          source: { kind: 'dsh-agent-compact' },
+        }),
+        'next-step',
+        false,
+      )
+    } catch (error: unknown) {
+      // 提醒投递失败：留证，但绝不因为「喊不出来」而中断会话。
+      trace({
+        phase: 'water-level-failed',
+        session: sessionTagOf(session),
+        waterLevel: rounded,
+        error: errorChain(error),
+      })
+    }
   }
 
   /** 处理一条含哨兵的助手消息：幂等 → 解析结论 → 提交或响亮报告。 */
@@ -535,7 +661,8 @@ type _CompactionSeamHolds = Assert<
 // 我贡献什么 + 我依赖什么服务」。排障第一步历来是「线上跑的是哪个构建」。
 trace({
   phase: 'boot',
-  note: 'v' + VERSION + ' inject=agents,tokenMeter,sessions;path=marker-driven(agent output);auto=none',
+  note: 'v' + VERSION + ' inject=agents,tokenMeter,sessions;path=marker-driven(agent output);auto=none;'
+    + 'gauge=water-level(' + String(WARN_LOW) + '/' + String(WARN_HIGH) + '/' + String(WARN_HARD) + ')',
 })
 
 export default AgentCompactEngine
