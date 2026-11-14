@@ -2,21 +2,25 @@
  * Surface retention selection and the shared log-recorded compaction
  * transaction for automatic open-turn and manual idle-session compaction.
  *
- * @module @deepseek-ai/dsh-compaction-basic/region
+ * @module dsh-agent-compact/region
  */
 
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
+// 运行期原语改为本插件自带副本：宿主那两个包封在 app.asar 里，外部插件解析不到。
+// 每一项的出处、抄法（抄 / 自写）与等价性依据见 `vendor.ts` 顶部。
+// 只剩**类型**还指向宿主（tsc 用它做契约漂移检查；类型在运行期被擦除）。
+import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
+import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import {
   CompactionId,
   ManualCompactionError,
   compactCheckpointSource,
+  createUserMessage,
+  errorChain,
   toolPairingBalancedAfter,
   toolPairingBalancedBefore,
-} from '@deepseek-ai/dsh-compaction'
-import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
-import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
+} from './vendor.ts'
 import type { ContentBlock, Message, TokenUsage, ToolSchema, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { TokenMeasurement, TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'

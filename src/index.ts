@@ -19,13 +19,17 @@
  * @module dsh-agent-compact
  */
 
-import { Context } from '@deepseek-ai/cordis'
-import { CompactionEngine, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
-import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
+// 只剩**类型**指向宿主：运行期原语全部在本插件的 `vendor.ts` 里（出处与抄法见该文件顶部）。
+// 为什么类型留着：tsc 用宿主的类型定义做契约漂移检查（`package.json` 的
+// `_comment_typeResolution` 明确要求「对宿主契约报错即说明有漂移，必须修源码」），
+// 而 `.d.ts` 里的 `import type` 在运行期被擦除、不参与模块解析——装不进 DSH 的是
+// **运行期** import，不是类型引用。
+import type { Context } from '@deepseek-ai/cordis'
+import type { CompactionEngine, CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { ManualCompactionError, createUserMessage, errorChain } from './vendor.ts'
 import { createArchiveDispatcher } from './archive.ts'
 import { CHECKPOINT_SENTINELS, buildRejectionNotice, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
 import type { CheckpointBlock } from './checkpoint-block.ts'
@@ -82,6 +86,21 @@ interface SessionView {
   readonly surface: { readonly nodes: readonly SessionSeq[] }
 }
 
+/**
+ * 宿主 `tool-result-pruner` 服务在本引擎里用到的**最小结构面**。
+ *
+ * 为什么按结构声明而不是 import 它的类型：那个包的**类型副本不在本仓 `node_modules`**
+ * 里（宿主封在 app.asar；本机 `node_modules/@deepseek-ai` 下没有它），tsc 会以
+ * TS2307 拒绝。这里只用一个方法，按结构声明即可——`ctx.get(服务名)` 走的是
+ * `get(name: string): any` 重载，运行期不依赖任何类型身份。
+ */
+interface ToolResultPrunerFacade {
+  pruneSession(session: Session): {
+    readonly pruned: readonly unknown[]
+    readonly charsRemoved: number
+  }
+}
+
 /** 进程内一次性告警去重（同一 seq 只在首次报告）。 */
 const reported = new WeakMap<object, Set<number>>()
 
@@ -92,10 +111,18 @@ const reported = new WeakMap<object, Set<number>>()
  * - **标记路径**（主路径，零额外请求）：agent 在自己任意一轮的输出里写合法 checkpoint 块。
  * - **工具路径**（显式）：调用方直接把摘要交给 {@link AgentCompactEngine.compactWithSummary}。
  */
-export class AgentCompactEngine extends CompactionEngine {
+export class AgentCompactEngine {
   static inject = ['agents', 'tokenMeter', 'sessions']
 
   static Config = Config
+
+  /**
+   * cordis 上下文。
+   *
+   * 宿主的 `CompactionEngine` 从 `Service` 继承了 `ctx` 字段；删掉继承后自己持有
+   * （本类全程只用 `this.ctx.get / on / logger / tokenMeter / agents / sessions`）。
+   */
+  readonly ctx: Context
 
   /** 已解析的部署配置。 */
   readonly config: ResolvedCompactConfig
@@ -110,8 +137,18 @@ export class AgentCompactEngine extends CompactionEngine {
   private readonly archiveDispatch: (trigger: string) => void
 
   constructor(ctx: Context, config: CompactConfig = {}) {
-    super(ctx)
+    this.ctx = ctx
     this.config = resolveConfig(config)
+    // 注册为 `ctx.compaction`（**解析完配置之后**：配置非法时不要留下半构造的服务）。
+    //
+    // 宿主 `CompactionEngine` 的构造函数只有一句 `super(ctx, 'compaction')`；而 cordis
+    // `Service` 构造函数在这里的**服务语义**就是 `ctx.reflect.provide('compaction', this)`
+    // （`ctx.provide` 是它的 mixin，见 cordis `ReflectService` 的 `mixin('reflect', [...])`）。
+    // 少掉的只是 `Service` 的**诊断**元数据（`symbols.tracker` / `name` / isolate 过滤），
+    // 前提已核实：全 DSH 没有任何 `instanceof CompactionEngine` 检查（唯一引用方
+    // `dsh-compaction-basic` 只是 `extends`），`/compact` 命令只调
+    // `ctx.compaction.compactNow(...)` —— 鸭子类型安全。
+    ctx.provide('compaction', this)
     this.archiveDispatch = createArchiveDispatcher({
       create: async (reason: string): Promise<void> => {
         const checkpoint = this.ctx.get('checkpoint') as
@@ -140,7 +177,7 @@ export class AgentCompactEngine extends CompactionEngine {
    * 别让框架强制影响你的决策」）。保留该实现只为满足 seam 契约——恒返回 `null`。
    * @returns 恒为 `null`（永不自动压缩）
    */
-  override compactIfNeeded(
+  compactIfNeeded(
     _agent: unknown,
     _trigger: CompactionTrigger,
     _signal: AbortSignal,
@@ -153,7 +190,7 @@ export class AgentCompactEngine extends CompactionEngine {
    * （标记路径）或显式调用方（工具路径）。
    * @throws {@link ManualCompactionError} 恒抛（`summary` 类），附替代路径说明
    */
-  override compactNow(): Promise<CompactionResult | null> {
+  compactNow(): Promise<CompactionResult | null> {
     return Promise.reject(new ManualCompactionError(
       'summary',
       'agent-driven compaction has no engine-initiated path: the summary must come from the '
@@ -167,7 +204,7 @@ export class AgentCompactEngine extends CompactionEngine {
    * 与「压缩由 agent 自己的输出供给」互斥。
    * @throws {@link ManualCompactionError} 恒抛（`summary` 类）
    */
-  override compactRegion(): Promise<CompactionResult> {
+  compactRegion(): Promise<CompactionResult> {
     return Promise.reject(new ManualCompactionError(
       'summary',
       'this backend compacts only with a caller-provided checkpoint; range compaction '
@@ -194,6 +231,9 @@ export class AgentCompactEngine extends CompactionEngine {
     sourceCommandId?: string,
   ): Promise<CompactionResult | null> {
     const session = agent.session as unknown as SessionView
+    // 先剪枝、再取表层/起点：剪枝会把工具结果节点原位替换成**新 seq** 的替换体，
+    // 反过来（先定区间再剪）会让区间里的 seq 失效。
+    this.pruneBeforeCompaction(session as unknown as Session, 'tool')
     const nodes = session.surface.nodes
     const headSeq = compactableHeadSeq(session as unknown as Session)
     const markerSeq = beforeSeq ?? nodes[nodes.length - 1] ?? 0
@@ -282,6 +322,9 @@ export class AgentCompactEngine extends CompactionEngine {
       return
     }
 
+    // 先剪枝、再取起点与区间（理由见 {@link pruneBeforeCompaction}）：区间必须建立在
+    // **剪枝之后**的表层上——剪枝会把工具结果原位替换成新 seq 的替换体，旧 seq 会失效。
+    this.pruneBeforeCompaction(session as unknown as Session, 'marker')
     const headSeq = compactableHeadSeq(session as unknown as Session)
     const span = selectMarkerSpan(session.surface.nodes, markerSeq, headSeq)
     if (span.kind === 'skip') {
@@ -368,6 +411,60 @@ export class AgentCompactEngine extends CompactionEngine {
   }
 
   /**
+   * 压缩前先跑一遍**模型无关**的 tool-result 剪枝。
+   *
+   * 为什么必须补这一调：`tool-result-pruner` 在宿主里是**独立服务**
+   * （`ctx.get('toolResultPruner')`），**它自己不会跑**——官方 `dsh-compaction-basic`
+   * 在「压力已达标、还没选区间」那一刻主动调 `pruneSession(agent.session)`，随后重新
+   * 计量再选区间（其 `index.ts` 的 `compactPressure`，rc.3 第 346-350 行；另一处是
+   * `compactIfNeeded` 的 `context-overflow` 分支，第 303 行）。换成标记驱动引擎后
+   * **没有任何人再调它** ⇒ 悄悄少了一道防线：本来能靠裁剪省下的上下文，变成了
+   * 「必须整段换摘要」。
+   *
+   * 为什么是「选区间之前」：剪枝对工具结果是**原位 replace**（替换体是新 seq），
+   * 先定区间再剪枝会让区间里的 seq 失效或不平衡。所以调用点必须在
+   * `compactableHeadSeq` / `selectMarkerSpan` 之前（两条入口都这么调）。
+   * 官方第二处（溢出恢复）本引擎没有对应路径：`compactIfNeeded` 恒 null，无自动压缩。
+   *
+   * **失败不阻断压缩**（与官方的差别，故意的）：官方那条调用外面裹着 pre-step 监听器
+   * 的 try/catch（失败就 warn 并跳过**那一步**）；本引擎的入口是 agent 自己写下的
+   * checkpoint——让一次**可选**的裁剪失败去丢掉一次压缩请求，是用优化换主功能。
+   * 故这里只如实记账（`prune-skipped` / `prune-failed`），主事务照走：裁剪本身对每个
+   * 节点是「append + replace」同步原子落盘，失败也留得下一致的表层。
+   * @param session - 要压缩的会话（剪枝直接改它的表层）。
+   * @param trigger - 本次压缩的入口（记账用）。
+   */
+  private pruneBeforeCompaction(session: Session, trigger: 'marker' | 'tool'): void {
+    const pruner = this.ctx.get('toolResultPruner') as ToolResultPrunerFacade | undefined
+    if (pruner === undefined) {
+      trace({
+        phase: 'prune-skipped',
+        trigger,
+        session: sessionTagOf(session),
+        note: 'toolResultPruner 服务不在本组合（未挂载 dsh-compaction-tool-result-pruner？）',
+      })
+      return
+    }
+    try {
+      const result = pruner.pruneSession(session)
+      if (result.pruned.length === 0) return
+      trace({
+        phase: 'pruned',
+        trigger,
+        session: sessionTagOf(session),
+        note: '裁掉 ' + String(result.pruned.length) + ' 条工具结果，省 ' + String(result.charsRemoved) + ' 字符',
+      })
+    } catch (error: unknown) {
+      trace({
+        phase: 'prune-failed',
+        trigger,
+        session: sessionTagOf(session),
+        error: errorChain(error),
+      })
+    }
+  }
+
+  /**
    * 派发一次压缩前存档（**不阻塞**，立即返回）。
    *
    * 服务不在本组合时**留证而不是静默**（§5.10：静默失败是死亡温床）——跳过行写明原因，
@@ -407,6 +504,32 @@ export class AgentCompactEngine extends CompactionEngine {
     }
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// seam 的编译期护栏（删掉 `extends CompactionEngine` 之后补回来）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 只取宿主 compaction seam 的三个方法。
+ *
+ * 为什么不是整类：宿主的 `CompactionEngine` 还从 `Service` 继承了 `name` 与几个
+ * symbol 键方法（`symbols.filter` / `symbols.extend` / `symbols.resolveConfig`），
+ * 那是基类私产、不是 seam 契约；本引擎不 isolate、不 `extend`，用不到。
+ */
+type CompactionSeam = Pick<CompactionEngine, 'compactIfNeeded' | 'compactNow' | 'compactRegion'>
+
+/** 编译期断言：`T` 必须为 `true`（不满足时这里报错，而不是让漂移潜伏）。 */
+type Assert<T extends true> = T
+
+/**
+ * 本类必须仍满足宿主的 compaction seam。
+ *
+ * 删掉继承后编译器不再替我们检查这三个方法的签名；这条断言把它们钉回宿主契约
+ * （`/compact` 会按鸭子类型调 `compactNow`）。指向宿主的只有**类型**，运行期零依赖。
+ */
+type _CompactionSeamHolds = Assert<
+  AgentCompactEngine extends CompactionSeam ? true : false
+>
 
 // 构建自报（可维护性，2026-09-14）：进程加载即落一行轨迹，声明「我是哪个构建 +
 // 我贡献什么 + 我依赖什么服务」。排障第一步历来是「线上跑的是哪个构建」。
