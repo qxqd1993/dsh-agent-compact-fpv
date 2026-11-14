@@ -78,11 +78,13 @@ function gaugeHarness(options = {}) {
   const engine = new AgentCompactEngine(ctx, {})
   const listener = listeners.get('agent/pre-step')
   assert.equal(typeof listener, 'function', '构造函数必须注册 agent/pre-step 监听器')
+  const markerListener = listeners.get('session/event')
 
   return {
     engine,
     sends,
     session,
+    markerListener,
     setLevel(value) { level = value },
     setCapacity(value) { capacity = value },
     /** 让后续的 send 成功/失败——用来证明「投递失败不吃档」。 */
@@ -200,5 +202,36 @@ describe('接线：agent/pre-step → 状态机 → 投递（桩上下文）', (
     new AgentCompactEngine(ctx, { enabled: false })
     assert.equal(listeners.has('agent/pre-step'), false)
     assert.equal(listeners.has('session/event'), false, '标记路径本就受 enabled 管，两者一起关')
+  })
+})
+
+describe('疑似块：标签在、哨兵缺——留痕，但不打扰', () => {
+  const feed = (h, text) => h.markerListener(
+    h.session,
+    { type: 'assistant/message', seq: 7, data: { message: { content: [{ type: 'text', text }] } } },
+  )
+
+  test('有 <compacted-summary> 却没有哨兵 → 落一笔 suspect', () => {
+    // 2026-11-14 实况：四格内容写得很好，只因为漏掉首行哨兵，引擎连 rejected 都
+    // 没记，只当没发生。哨兵是整块里唯一不承载内容的一行，也就最容易忘。
+    const h = gaugeHarness({ sessionId: 'session-suspect' })
+    feed(h, '我压一下：\n\n<compacted-summary>\n\n## 此刻\n…\n\n## 沉澱\n…\n\n</compacted-summary>')
+    const lines = traceLines('suspect', 'suspect')
+    assert.equal(lines.length, 1)
+    assert.match(String(lines[0].note), /哨兵/)
+  })
+
+  test('但绝不注入通知——外壳不带哨兵正是「引用模板」的形态', () => {
+    const h = gaugeHarness({ sessionId: 'session-suspect2' })
+    feed(h, '模板长这样：\n\n<compacted-summary>\n## 此刻\n…\n</compacted-summary>')
+    assert.equal(h.sends.length, 0, '每次讨论格式都弹告知，比不提醒更糟')
+    assert.equal(traceLines('suspect', 'suspect2').length, 1)
+  })
+
+  test('两个标签都没有 → 连 suspect 都不落（绝大多数消息不该留痕）', () => {
+    const h = gaugeHarness({ sessionId: 'session-plain' })
+    feed(h, '就是一段普通的话，没有任何标签。')
+    assert.equal(h.sends.length, 0)
+    assert.equal(traceLines('suspect', 'plain').length, 0)
   })
 })

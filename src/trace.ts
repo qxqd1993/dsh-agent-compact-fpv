@@ -56,6 +56,7 @@ export type TracePhase =
   | 'prune-failed'
   | 'water-level'
   | 'water-level-skipped'
+  | 'suspect'
   | 'water-level-failed'
   | 'archive-dispatched'
   | 'archive-settled'

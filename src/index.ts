@@ -33,7 +33,7 @@ import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { ManualCompactionError, createUserMessage, errorChain } from './vendor.ts'
 import { createArchiveDispatcher } from './archive.ts'
-import { CHECKPOINT_SENTINELS, buildRejectionNotice, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
+import { CHECKPOINT_CLOSE_TAG, CHECKPOINT_OPEN_TAG, CHECKPOINT_SENTINELS, buildRejectionNotice, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
 import type { CheckpointBlock } from './checkpoint-block.ts'
 import { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
 import { compactableHeadSeq, compactSurfaceRegion, inspectCompactionEntryState } from './region.ts'
@@ -302,8 +302,26 @@ export class AgentCompactEngine {
       if (event.type !== 'assistant/message') return
       const data = event.data as { message?: { content?: unknown } } | undefined
       const text = assistantTextOf(data?.message?.content)
-      // 快筛：没有哨兵就不是压缩意图——绝大多数消息在这里返回，零后续成本
-      if (!CHECKPOINT_SENTINELS.some(s => text.includes(s))) return
+      // 快筛：没有哨兵就不是压缩意图——绝大多数消息在这里返回，零后续成本。
+      //
+      // 但「没有哨兵」有两种：真的不是意图，和「想压缩但漏了哨兵」。后者 2026-11-14
+      // 真实发生过：一块四格内容写得很好，只因为漏掉首行哨兵，引擎连 `rejected` 都
+      // 没记，只当没发生——而哨兵恰好是整块里唯一不承载内容的一行，也就最容易忘。
+      //
+      // 这里**不注入通知**：外壳不带哨兵正是「引用模板」的形态（`formatCheckpointBlock`
+      // 的产物就是这样），每次讨论格式都弹一条告知，比不提醒更糟。只落一笔可查的
+      // 痕迹——那次是自己去 tail trace 才发现的，那就把线索留在那里。
+      if (!CHECKPOINT_SENTINELS.some(s => text.includes(s))) {
+        if (text.includes(CHECKPOINT_OPEN_TAG) || text.includes(CHECKPOINT_CLOSE_TAG)) {
+          trace({
+            phase: 'suspect',
+            session: sessionTagOf(session as unknown as SessionView),
+            note: '出现 ' + CHECKPOINT_OPEN_TAG + ' / ' + CHECKPOINT_CLOSE_TAG
+              + ' 但无契约哨兵——若是想压缩，缺的是首行 <!-- self-compact --> 或 <!-- handoff-compact -->',
+          })
+        }
+        return
+      }
       const parsed = parseCheckpointBlock(text, this.config.minCheckpointChars)
       if (parsed.kind === 'absent') return
       setImmediate(() => {
