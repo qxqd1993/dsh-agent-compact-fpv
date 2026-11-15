@@ -130,6 +130,29 @@ export function isInsideFence(text: string, index: number): boolean {
  * @param sections - 该契约要求的 section 标题（按序）
  * @returns 至多 3 条近似命中说明
  */
+/**
+ * 六格标题里会出现简繁差异的字，只这一批（不做整表）。
+ *
+ * 为什么不做整表：折叠要**逐字一对一、长度不变**，下标才能直接用于原文切片。
+ * 一张大表会让「折了但变长」的风险扩散到六个标题之外，而收益几乎为零。
+ */
+const SECTION_SCRIPT_FOLD: Readonly<Record<string, string>> = {
+  '來': '来', '響': '响', '這': '这', '輪': '轮', '麼': '么', '虧': '亏', '沒': '没', '澱': '淀',
+}
+
+/**
+ * 把标题里的简繁差异折到同一形——**只用于匹配**，不用于输出。
+ *
+ * 为什么需要（2026-11-15）：格式管的是「哪几格存在」，不是「用哪套汉字写」。我平时
+ * 简繁混写，滑进简体就白丢一次压缩机会；而失败理由是「缺少 section」，看的人会以为
+ * 我漏了整格，其实写的是同一格。
+ * @param text - 任意文本（正文或标题）
+ * @returns 折叠后的文本，**长度与原串相同**（所以下标可直接用于原文切片）
+ */
+function foldSectionScript(text: string): string {
+  return text.replace(/[來響這輪麼虧沒澱]/g, (ch) => SECTION_SCRIPT_FOLD[ch] ?? ch)
+}
+
 function diagnoseMissingSections(body: string, sections: readonly string[]): string[] {
   const lines = body
     .split('\n')
@@ -138,7 +161,9 @@ function diagnoseMissingSections(body: string, sections: readonly string[]): str
   const hints: string[] = []
   for (const section of sections) {
     const core = section.replace(/^#+\s*/, '')
-    const near = lines.find(line => line.includes(core) && !line.startsWith(section))
+    // 近似命中也要折过再比：否则写成简体时，「其实写的就是这一格」会被报成「缺格」。
+    const near = lines.find(line => foldSectionScript(line).includes(foldSectionScript(core))
+      && !line.startsWith(section))
     if (near !== undefined) {
       const shown = near.length > 60 ? near.slice(0, 60) + '…' : near
       hints.push('实际写作「' + shown + '」（要求逐字：' + section + '）')
@@ -313,8 +338,13 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
   // 记下每个 section 标题的起点：格内「有没有内容」要靠它与下一格起点切出区间。
   const positions: number[] = []
   let scanFrom = 0
+  // 简繁归一（2026-11-15）：**匹配**用折过的文本，**切片**仍用原文。
+  // 折叠是逐字一对一、长度不变，所以 folded 的下标可以直接拿去切 body。
+  // 为什么不改写正文：正文要原样落盘——侧车和存档都得照抄我真正写过的字，
+  // 抄一份被我改写过的东西等于造假（与 negative.ts 里「自认字样的归一」同一条纪律）。
+  const folded = foldSectionScript(body)
   for (const section of contract.sections) {
-    const found = body.indexOf(section, scanFrom)
+    const found = folded.indexOf(foldSectionScript(section), scanFrom)
     if (found === -1) {
       missing.push(section)
       continue

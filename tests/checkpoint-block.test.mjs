@@ -330,3 +330,49 @@ describe('diagnoseBestCandidate · 显式最优起点', () => {
     assert.equal(diagnoseBestCandidate(fenced).present, true)
   })
 })
+
+describe('简繁归一 · 格标题（2026-11-15）', () => {
+  /**
+   * 为什么有这一组：格式管的是「哪几格存在」，不是「用哪套汉字写」。
+   * 我平时简繁混写，滑进简体就白丢一次压缩机会；而失败理由是「缺少 section」，
+   * 看的人会以为整格没写，其实写的是同一格。
+   */
+  const SIMP_SECTIONS = ['## 此刻', '## 近来', '## 回响', '## 这一轮我吃了什么亏', '## 我没查的', '## 沉淀']
+  const filler = (index) => '- 第' + String(index) + '格内容' + 'x'.repeat(50)
+  const simplifiedBody = () => SIMP_SECTIONS
+    .map((section, index) => section + '\n' + filler(index))
+    .join('\n')
+
+  test('简体六格 → valid', () => {
+    const parsed = parseCheckpointBlock(selfBlock(simplifiedBody()), MIN)
+    assert.equal(parsed.kind, 'valid', parsed.kind === 'invalid' ? parsed.reason : '')
+  })
+
+  test('简繁混写（同一块里两套字）→ valid', () => {
+    const mixed = ['## 此刻', '## 近來', '## 回响', '## 这一轮我吃了什么亏', '## 我沒查的', '## 沉澱']
+      .map((section, index) => section + '\n' + filler(index))
+      .join('\n')
+    const parsed = parseCheckpointBlock(selfBlock(mixed), MIN)
+    assert.equal(parsed.kind, 'valid', parsed.kind === 'invalid' ? parsed.reason : '')
+  })
+
+  test('归一**不改写正文**：简体块返回的正文里仍是简体原字', () => {
+    const parsed = parseCheckpointBlock(selfBlock(simplifiedBody()), MIN)
+    assert.equal(parsed.kind, 'valid')
+    assert.ok(parsed.body.includes('我没查的'), '正文必须原样保留我写的字（侧车/存档要照抄）')
+    assert.ok(!parsed.body.includes('我沒查的'), '不得被折叠成繁体——那是改写我的原话')
+  })
+
+  test('简体仍缺一格 → invalid，且理由点名缺的那格', () => {
+    const body = simplifiedBody().replace('## 沉淀\n' + filler(5), '')
+    const parsed = parseCheckpointBlock(selfBlock(body), MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.match(parsed.reason, /沉澱|沉淀/, '必须点名缺的是哪一格')
+  })
+
+  test('归一不影响空白判据：简体块的某格写成空白 → 仍 invalid', () => {
+    const body = simplifiedBody().replace(filler(4), '')
+    const parsed = parseCheckpointBlock(selfBlock(body), MIN)
+    assert.equal(parsed.kind, 'invalid')
+  })
+})
