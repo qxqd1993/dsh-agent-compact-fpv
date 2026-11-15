@@ -20,6 +20,8 @@ import { existsSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { importOrFail, pluginLib } from './_resolve.mjs'
+
 /**
  * 路径解析：Windows 形态优先，缺失时回退 WSL 形态（`E:/x` → `/mnt/e/x`）。
  *
@@ -28,20 +30,9 @@ import test from 'node:test'
  * @param winPath - Windows 形态的绝对路径。
  * @returns 本机真实存在的那个形态。
  */
-function pickRoot(winPath) {
-  if (existsSync(winPath)) return winPath
-  return winPath.replace(/^([A-Za-z]):/, (_, drive) => `/mnt/${drive.toLowerCase()}`)
-}
+const archiveLib = pluginLib('lib/archive.js')
 
-const PLUGIN = process.env.DSH_COMPACT_ROOT ?? pickRoot('E:/alice/self-plugins/dsh-agent-compact')
-const archiveLib = `${PLUGIN}/lib/archive.js`
-
-if (!existsSync(archiveLib)) {
-  console.error(`[skip] 缺少已构建产物：${archiveLib}`)
-  process.exit(0)
-}
-
-const { createArchiveDispatcher, archiveReason } = await import(pathToFileURL(archiveLib).href)
+const { createArchiveDispatcher, archiveReason } = await importOrFail(archiveLib, 'lib/archive.js')
 
 /**
  * 测试台：注入 create 桩 + 轨迹/告警收集器 + 每次推进 100ms 的假时钟。

@@ -34,7 +34,9 @@
     "prepare": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsc -p tsconfig.json && node --test \"tests/*.test.mjs\""
+    "test": "tsc -p tsconfig.json && node --test \"tests/*.test.mjs\"",
+    "test:files": "pwsh -NoProfile -File tools/run-tests.ps1",
+    "test:files:skip": "pwsh -NoProfile -File tools/run-tests.ps1 -AllowSkip"
   },
   "_comment_typeResolution": "本插件的 @deepseek-ai/* 由宿主 link farm（E:/alice/node_modules）解析到 deepseek-harness workspace 单实例——本目录 node_modules 下不得存在 @deepseek-ai 真实副本（会遮蔽宿主、导致 API/class 身份漂移）。2026-09-11 已清理；构建恢复全量类型检查（tsc 对宿主契约报错即说明有漂移，必须修源码而非跳过检查）。"
 }

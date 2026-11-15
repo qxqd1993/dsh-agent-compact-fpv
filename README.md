@@ -54,6 +54,27 @@
 
 **幂等不落盘**：`markerSeq < 最近一次 compaction/end 的 seq` ⇒ 跳过。用事件流自身当状态，重启重扫不会二次压缩。
 
+## 跑测试（两条路，别用错）
+
+```bash
+npm test              # 常规：tsc + node --test（每个档一个子进程，隔离干净）
+npm run test:files    # 受限沙盒：逐档跑，缺依赖默认判红
+npm run test:files:skip  # 同上，但缺依赖的档记 SKIP
+```
+
+**为什么要有第二条**（2026-11-15 实测）：`node --test` 会为每个测试档 spawn 子进程并接管
+管道；在 DSH 的受限沙盒里子进程管道被禁 ⇒ 所有档同时报 `spawn EPERM`，看起来像全盘崩了。
+`node <档>` 在进程内跑 `node:test` 完全没问题——差别只在「谁来起进程」。
+
+`--test-isolation=none` 试过，不行：它确实不起子进程，但**和致命检查不共存**——任何
+一个档里 `process.exit()` 都会把整个 runner 带走，「缺依赖判红」就没法用。
+
+**三个档需要宿主运行时**（`compact-range` / `owner-turn`，以及任何 `import` 宿主包的
+档）：本目录的 `node_modules/@deepseek-ai/*` 是**类型用的 registry 副本**，`package.json`
+的 `_comment_typeResolution` 明令不得使用（会遮蔽宿主 link farm）。要真跑它们，把
+`DSH_HARNESS_ROOT` 指到宿主源码树；指不到就**判红**——静默跳过会让回归面看起来是绿的，
+2026-11-15 就是这么被骗过一次（三个档被 `node --test` 记成 pass）。
+
 ## 快速开始
 
 **1) 装依赖**（引擎与 provider 是**回退对**——同进同退，禁止单侧回退）：

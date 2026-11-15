@@ -20,9 +20,10 @@
  * 运行：先构建（tsc），再 node --test tests/compact-range.test.mjs
  */
 import { pathToFileURL } from 'node:url'
-import { existsSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import test from 'node:test'
+
+import { harnessLib, importOrFail, pluginLib } from './_resolve.mjs'
 
 /**
  * 路径解析：Windows 形态优先，缺失时回退 WSL 形态（`E:/x` → `/mnt/e/x`）。
@@ -33,27 +34,17 @@ import test from 'node:test'
  * @param winPath - Windows 形态的绝对路径。
  * @returns 本机真实存在的那个形态。
  */
-function pickRoot(winPath) {
-  if (existsSync(winPath)) return winPath
-  return winPath.replace(/^([A-Za-z]):/, (_, drive) => `/mnt/${drive.toLowerCase()}`)
-}
+// 2026-11-15：不再钉死 `E:/alice/deepseek-harness`（那是另一台机器的布局，本机没有 ⇒
+// 整档 process.exit(0)，而 node --test 把退出码 0 记成 pass）。改由 `_resolve.mjs`
+// 先找 `DSH_HARNESS_ROOT`、再退到本仓 `node_modules/@deepseek-ai/*`。
+// 缺依赖时**默认判红**（`skipOrFail`），要放行得显式设 DSH_ALLOW_TEST_SKIP=1。
+const sessionLib = harnessLib('dsh-session', 'packages/core/session/lib/index.js')
+const llmLib = harnessLib('dsh-llm', 'packages/llm/llm/lib/index.js')
+const regionLib = pluginLib('lib/region.js')
 
-const HARNESS = process.env.DSH_HARNESS_ROOT ?? pickRoot('E:/alice/deepseek-harness')
-const PLUGIN = process.env.DSH_COMPACT_ROOT ?? pickRoot('E:/alice/self-plugins/dsh-agent-compact')
-const sessionLib = `${HARNESS}/packages/core/session/lib/index.js`
-const llmLib = `${HARNESS}/packages/llm/llm/lib/index.js`
-const regionLib = `${PLUGIN}/lib/region.js`
-
-for (const p of [sessionLib, llmLib, regionLib]) {
-  if (!existsSync(p)) {
-    console.error(`[skip] 缺少已构建产物：${p}`)
-    process.exit(0)
-  }
-}
-
-const { Session, SessionId } = await import(pathToFileURL(sessionLib).href)
-const { createSystemMessage, createUserMessage, createMessage } = await import(pathToFileURL(llmLib).href)
-const { selectCompactableRange } = await import(pathToFileURL(regionLib).href)
+const { Session, SessionId } = await importOrFail(sessionLib, 'dsh-session')
+const { createSystemMessage, createUserMessage, createMessage } = await importOrFail(llmLib, 'dsh-llm')
+const { selectCompactableRange } = await importOrFail(regionLib, 'lib/region.js')
 
 /** 建一个以 system/message 打头（surface node 0）的真实会话，带若干对话节点。 */
 function sessionWithSystemHead() {
