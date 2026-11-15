@@ -216,13 +216,26 @@ test('存档不得阻塞提交（源码级断言，防回退到 await 存档）'
   );
 });
 
-test('commit() 的计时覆盖两条入口（标记 / 工具），且返回值形状一致', () => {
+test('commit() 的计时与水位读数覆盖两条入口（标记 / 工具），且返回值形状一致', () => {
   const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
-  // 两条入口都解构同一个返回形状——若某一处漏解构，那条路径的耗时就会静默丢失
-  const destructured = src.match(/const \{ result, txnMs \} = await this\.commit\(/g) ?? [];
-  assert.equal(destructured.length, 2, '标记路径与工具路径都必须解构 { result, txnMs }');
+  // 两条入口都解构同一个返回形状——若某一处漏解构，那条路径的耗时/读数就会静默丢失
+  const destructured = src.match(/const \{ result, txnMs, levels \} = await this\.commit\(/g) ?? [];
+  assert.equal(destructured.length, 2, '标记路径与工具路径都必须解构 { result, txnMs, levels }');
   assert.ok(
-    /return \{ result, txnMs: Date\.now\(\) - txnStartedAt \}/.test(src),
+    /const txnMs = Date\.now\(\) - txnStartedAt/.test(src),
     'commit() 必须回传真实事务耗时，而不是只回传 result',
   );
+  // 水位读数必须在事务**前后各量一次**：只量一次的话「降了几个点」就算不出来，
+  // 只能事后推——2026-11-15 就是这么把一次读数推成「地板」的。
+  assert.ok(
+    /const levels = this\.measureLevels\(session\)/.test(src),
+    'commit() 必须在事务之前量一次水位',
+  );
+  assert.ok(
+    /\.\.\.this\.measureLevels\(session, true\)/.test(src),
+    'commit() 必须在事务之后再量一次水位',
+  );
+  // 两条路径的 committed 行都得带上读数；漏一处，那条路径的压缩就没有前后水位。
+  const spread = src.match(/\n\s+\.\.\.levels,/g) ?? [];
+  assert.equal(spread.length, 2, '两条入口的 committed 行都必须展开 ...levels');
 });

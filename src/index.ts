@@ -50,8 +50,9 @@ import {
   WARN_LOW,
   advanceGauge,
   buildWaterLevelNotice,
+  readLevels,
 } from './water-level.ts'
-import type { GaugeState } from './water-level.ts'
+import type { CompactionLevels, GaugeState } from './water-level.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -281,13 +282,14 @@ export class AgentCompactEngine {
       return null
     }
     const startedAt = Date.now()
-    const { result, txnMs } = await this.commit(
+    const { result, txnMs, levels } = await this.commit(
       session as unknown as Session, span.start as SessionSeq, span.end as SessionSeq,
       agent, summary, 'tool', sourceCommandId,
     )
     trace({
       phase: 'committed', trigger: 'tool', session: sessionTagOf(session),
       chars: summary.length, txnMs, totalMs: Date.now() - startedAt,
+      ...levels,
       bestCandidate: diagnoseBestCandidate(summary).present,
       note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
         + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
@@ -520,7 +522,7 @@ export class AgentCompactEngine {
     })
     const startedAt = Date.now()
     try {
-      const { result, txnMs } = await this.commit(
+      const { result, txnMs, levels } = await this.commit(
         session as unknown as Session,
         span.start as SessionSeq,
         span.end as SessionSeq,
@@ -531,6 +533,7 @@ export class AgentCompactEngine {
       trace({
         phase: 'committed', trigger: 'marker', session: sid, seqFloor: markerSeq,
         chars: parsed.chars, txnMs, totalMs: Date.now() - startedAt,
+        ...levels,
         bestCandidate: diagnoseBestCandidate(parsed.body).present,
         note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
           + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
@@ -560,12 +563,15 @@ export class AgentCompactEngine {
     body: string,
     trigger: 'marker' | 'tool',
     sourceCommandId?: string,
-  ): Promise<{ result: CompactionResult; txnMs: number }> {
+  ): Promise<{ result: CompactionResult; txnMs: number; levels: CompactionLevels }> {
     // 存档**不等**（2026-09-27 线上实测）：等它要 27,270 ms，而事务本身只 66 ms。
     // 语义安全：存档内容是 storages + AGENTS.md，而压缩只改**会话事件流**，
     // 两者无因果关系 ⇒ 并行不产生竞态。
     this.dispatchArchive(trigger)
     const blocks: ContentBlock[] = [{ type: 'text', text: body }]
+    // 水位读数**不进 txnMs**：计量本身不是事务的一部分（region.ts 内部那两次计量已经
+    // 被算进 txnMs，这里再算会造成「事务变慢了」的假象）。所以先量后计时，量完停表前不再量。
+    const levels = this.measureLevels(session)
     const txnStartedAt = Date.now()
     const result = await compactSurfaceRegion(
       {
@@ -589,7 +595,35 @@ export class AgentCompactEngine {
         flush: async () => { await this.ctx.sessions.flush(session) },
       },
     )
-    return { result, txnMs: Date.now() - txnStartedAt }
+    const txnMs = Date.now() - txnStartedAt
+    return { result, txnMs, levels: { ...levels, ...this.measureLevels(session, true) } }
+  }
+
+  /**
+   * 量一次水位：分子 `measure().totalTokens`，分母 `contextPressure().contextWindow`
+   * （与 `observeWaterLevel` / compaction-basic 的阈值判据同源）。
+   *
+   * 为什么要有（2026-11-15）：`shadowedTokenCount` 只答「吞掉多少」，答不了「剩下多少」，
+   * 于是「压完水位降到几」只能事后推。笔者就推错过一次——把一次读数当成了结构性的「地板」。
+   * 现在前后各量一次，差值就是真的，不用猜。
+   *
+   * **绝不抛**：量不出来（分母未知 / 计量器异常）就返回空对象，让 `committed` 少两个字段。
+   * 读数失败不许吃掉一次成功的压缩。
+   * @param session - 要量的会话
+   * @param after - true 表示这是事务**之后**那一次（只影响产出字段名）
+   * @returns 水位百分比与 token 量（一位小数 / 整数）；量不出来时为空对象
+   */
+  private measureLevels(session: Session, after = false): CompactionLevels {
+    const reading = readLevels(this.ctx.tokenMeter, session as unknown as Session, after)
+    if (reading.error !== undefined) {
+      // 读数失败不静默，也不参与压缩成败：一次成功的压缩不该被一个计量异常吃掉。
+      trace({
+        phase: 'water-level-skipped',
+        session: sessionTagOf(session),
+        note: '压缩前后计量失败（不影响压缩本身）：' + reading.error,
+      })
+    }
+    return reading.levels
   }
 
   /**

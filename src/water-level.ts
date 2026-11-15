@@ -171,3 +171,62 @@ export function buildWaterLevelNotice(waterLevel: number): string {
     '③ 换一个会话重新开始。',
   ].join('\n')
 }
+
+/** 计量器的最小面（只用到两个方法；测试可喂桩，不必造真会话）。 */
+export interface LevelMeter<S> {
+  measure(session: S): { readonly totalTokens: number }
+  contextPressure(session: S): { readonly contextWindow?: number }
+}
+
+/** 压缩前后的水位读数（`committed` 行）。量不出来时字段**缺席**，不写 0。 */
+export interface CompactionLevels {
+  waterLevelBefore?: number
+  waterLevelAfter?: number
+  tokensBefore?: number
+  tokensAfter?: number
+}
+
+/**
+ * 读一次水位（{@link readLevels} 的结果）。
+ *
+ * `error` 存在时 `levels` 是空对象：**读数失败不许吃掉一次成功的压缩**。
+ */
+export interface LevelReading {
+  readonly levels: CompactionLevels
+  readonly error?: string
+}
+
+/**
+ * 量一次水位：分子 `measure().totalTokens`，分母 `contextPressure().contextWindow`。
+ *
+ * 为什么要有（2026-11-15）：`shadowedTokenCount` 只答「吞掉多少」，答不了「剩下多少」。
+ * 于是「压完降到几个点」只能事后推——笔者就据此把**一次读数**推成了结构性的「地板」，
+ * 推错了。前后各量一次，差值就是真的，不需要推断。
+ *
+ * 分母未知（会话还没有 `request/context` 记录）时只给 token 量、不给百分比：
+ * 百分比在那种情况下无处可比，编一个出来就是假读数。
+ * @param meter - 计量器（`ctx.tokenMeter`，或测试桩）
+ * @param session - 要量的会话
+ * @param after - true 表示这是事务**之后**那一次（只影响产出字段名）
+ * @returns 读数；计量器抛错时给出 `error` 与空读数
+ */
+export function readLevels<S>(
+  meter: LevelMeter<S>,
+  session: S,
+  after: boolean,
+): LevelReading {
+  try {
+    const { totalTokens } = meter.measure(session)
+    const { contextWindow } = meter.contextPressure(session)
+    const known = typeof contextWindow === 'number'
+      && Number.isSafeInteger(contextWindow) && contextWindow > 0
+    const waterLevel = known ? Math.round((totalTokens / contextWindow) * 1000) / 10 : undefined
+    return {
+      levels: after
+        ? { tokensAfter: totalTokens, ...(waterLevel === undefined ? {} : { waterLevelAfter: waterLevel }) }
+        : { tokensBefore: totalTokens, ...(waterLevel === undefined ? {} : { waterLevelBefore: waterLevel }) },
+    }
+  } catch (error: unknown) {
+    return { levels: {}, error: error instanceof Error ? error.message : String(error) }
+  }
+}

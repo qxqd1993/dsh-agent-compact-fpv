@@ -132,6 +132,19 @@ export interface TraceEntry {
    * 而不是靠人回忆上一步发生了什么。
    */
   waterLevel?: number
+  /**
+   * 压缩**之前**那一刻的水位百分比（`committed` 行，一位小数）。
+   *
+   * 为什么要有（2026-11-15）：`shadowedTokenCount` 记的是「被吞掉多少」，答不了
+   * 「压完剩下多少」。于是「这次压缩降了几个点」只能事后靠推——笔者据此把一次读数
+   * 推成了结构性「地板」，推错了。两个读数各自落一行，这个问题就不再需要推断。
+   */
+  waterLevelBefore?: number
+  /** 压缩**之后**立刻量到的水位百分比（`committed` 行，一位小数）。 */
+  waterLevelAfter?: number
+  /** 压缩前后的 token 总量（同一读数器的分子；不靠百分比反推）。 */
+  tokensBefore?: number
+  tokensAfter?: number
   /** 水位档位（`water-level` 行）：向下取整到档距的整数倍。 */
   bucket?: number
   /** 本次档距（`water-level` 行）：1 = 红线档（≥75%），2 = 温和档。 */
@@ -214,6 +227,10 @@ export function serializeTraceEntry(entry: TraceEntry): string {
     ...(entry.txnMs !== undefined ? { txnMs: entry.txnMs } : {}),
     ...(entry.totalMs !== undefined ? { totalMs: entry.totalMs } : {}),
     ...(entry.waterLevel !== undefined ? { waterLevel: entry.waterLevel } : {}),
+    ...(entry.waterLevelBefore !== undefined ? { waterLevelBefore: entry.waterLevelBefore } : {}),
+    ...(entry.waterLevelAfter !== undefined ? { waterLevelAfter: entry.waterLevelAfter } : {}),
+    ...(entry.tokensBefore !== undefined ? { tokensBefore: entry.tokensBefore } : {}),
+    ...(entry.tokensAfter !== undefined ? { tokensAfter: entry.tokensAfter } : {}),
     ...(entry.bucket !== undefined ? { bucket: entry.bucket } : {}),
     ...(entry.stepSize !== undefined ? { stepSize: entry.stepSize } : {}),
     ...(entry.chars !== undefined ? { chars: entry.chars } : {}),
