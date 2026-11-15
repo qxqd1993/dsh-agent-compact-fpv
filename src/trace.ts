@@ -58,6 +58,16 @@ export type TracePhase =
   | 'water-level-baseline'
   | 'water-level-skipped'
   | 'suspect'
+  /**
+   * 无据的否定：回复里对某个路径下了否定判断（没变／没有／不存在／没挂），
+   * 而本会话没有读过它的**内容**（2026-11-15 事故：用 `Get-ChildItem` 的 mtime
+   * 断言「你没往里加东西」）。只记账，不提醒——误报率测出来之前不进版面。
+   */
+  | 'unbacked-negative'
+  /** 写块那一刻的引用对账：块里点了名的路径，本会话没读过。只报「确证」这一档。 */
+  | 'ref-unread'
+  /** 对账本身没跑成（索引建不出来 / 正文读不到）：留证，不阻断压缩。 */
+  | 'ref-unread-skipped'
   | 'water-level-failed'
   | 'archive-dispatched'
   | 'archive-settled'

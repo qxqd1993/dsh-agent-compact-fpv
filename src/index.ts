@@ -36,6 +36,12 @@ import { createArchiveDispatcher } from './archive.ts'
 import { CHECKPOINT_CLOSE_TAG, CHECKPOINT_OPEN_TAG, CHECKPOINT_SENTINELS, buildRejectionNotice, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
 import type { CheckpointBlock } from './checkpoint-block.ts'
 import { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
+import { buildReadIndex, noteToolCall } from './read-index.ts'
+import type { ReadIndex, SessionEventView } from './read-index.ts'
+import { findUnbackedNegatives } from './negative.ts'
+import { confirmedOnly, reconcileReferences } from './reconcile.ts'
+import { statSync } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
 import { compactableHeadSeq, compactSurfaceRegion, inspectCompactionEntryState } from './region.ts'
 import { pruneBeforeCompaction as pruneToolResults } from './prune.ts'
 import type { PruneSessionView } from './prune.ts'
@@ -119,6 +125,14 @@ interface ToolResultPrunerFacade {
 const reported = new WeakMap<object, Set<number>>()
 
 /**
+ * 单条消息里最多报几条。
+ *
+ * 上限不是为了省字，是为了**保住提醒的可信度**：一条回复里堆二十条清单，人只会
+ * 扫一眼然后全部忽略。宁可选前几条，也不做一份没人看的报表。
+ */
+const MAX_REPORTS_PER_MESSAGE = 5
+
+/**
  * 标记驱动压缩引擎。
  *
  * 两条入口共用同一个事务：
@@ -163,6 +177,18 @@ export class AgentCompactEngine {
 
   /** 已经为「水位基线」记过一笔的会话（见 observeWaterLevel 里的基线说明）。 */
   private readonly gaugeBaselineReported = new WeakSet<object>()
+
+  /**
+   * 每个会话的「读过什么**内容**」索引（懒建 + 增量）。
+   *
+   * 为什么需要它（2026-11-15）：我在回复里说「某个文件没变／没有新内容」，而那次会话
+   * 根本没打开过它——用的是 `Get-ChildItem` 给的 mtime。要抓这种句子，先得能回答
+   * 「这个会话读过它没有」。判定细节（`read`/`grep` 算读、目录列举不算）在
+   * `read-index.ts`，这里只负责拿与更新。
+   *
+   * WeakMap：会话被回收即释放，不需要手动清。
+   */
+  private readonly readIndexes = new WeakMap<object, ReadIndex>()
 
   constructor(ctx: Context, config: CompactConfig = {}) {
     this.ctx = ctx
@@ -306,13 +332,20 @@ export class AgentCompactEngine {
    */
   private registerMarkerPath(): void {
     this.ctx.on('session/event', (session, event) => {
+      if (event.type === 'tool/call') {
+        this.noteReadCall(session as unknown as SessionView, event)
+        return
+      }
       if (event.type !== 'assistant/message') return
       const data = event.data as { message?: { content?: unknown } } | undefined
       const text = assistantTextOf(data?.message?.content)
+      // 观测一：无据的否定。只记账、不提醒——误报率测出来之前不进版面（见 trace.ts 的
+      // `unbacked-negative`）。放在快筛**之前**：没有哨兵的普通回复同样要查。
+      this.reportUnbackedNegatives(session as unknown as SessionView, text)
       // 快筛：没有哨兵就不是压缩意图——绝大多数消息在这里返回，零后续成本。
       //
       // 但「没有哨兵」有两种：真的不是意图，和「想压缩但漏了哨兵」。后者 2026-11-14
-      // 真实发生过：一块四格内容写得很好，只因为漏掉首行哨兵，引擎连 `rejected` 都
+      // 真实发生过：一块内容写得很好（当时是四格，2026-11-15 起为六格），只因为漏掉首行哨兵，引擎连 `rejected` 都
       // 没记，只当没发生——而哨兵恰好是整块里唯一不承载内容的一行，也就最容易忘。
       //
       // 这里**不注入通知**：外壳不带哨兵正是「引用模板」的形态（`formatCheckpointBlock`
@@ -331,10 +364,139 @@ export class AgentCompactEngine {
       }
       const parsed = parseCheckpointBlock(text, this.config.minCheckpointChars)
       if (parsed.kind === 'absent') return
+      // 观测二：写块**那一刻**的引用对账，命中就当场提醒。
+      //
+      // 为什么放在这里而不是压缩提交时（2026-11-15 定）：压缩要等到水位过线才发生，
+      // 而块一写下去就成了断口那一头的全部材料——等压缩再查，人已经翻页了。
+      // 「早发现早修正」比「压完再对账」便宜一个数量级。
+      //
+      // 它**绝不阻断压缩**：查不成就记一笔 skip，照常 setImmediate 提交。
+      //
+      // 只对 `valid` 做：不合法的块不会被提交，也就不会成为断口那头的材料，
+      // 对它对账等于给一张废纸做校对。
+      if (parsed.kind === 'valid') this.reconcileBlock(session as unknown as SessionView, event.seq, parsed.body)
       setImmediate(() => {
         void this.handleMarker(session as unknown as SessionView, event.seq, parsed)
       })
     })
+  }
+
+  /**
+   * 拿（或懒建）本会话的读取索引。
+   * @param session - 会话视图（同时要能被当作事件流读）
+   * @returns 索引；建不出来时抛，由调用方接住
+   */
+  private readIndexOf(session: SessionView): ReadIndex {
+    const key = session as unknown as object
+    const cached = this.readIndexes.get(key)
+    if (cached !== undefined) return cached
+    const built = buildReadIndex(session as unknown as SessionEventView)
+    this.readIndexes.set(key, built)
+    return built
+  }
+
+  /**
+   * 把一条 `tool/call` 併进索引（增量，不重建）。
+   *
+   * 事件是**追加**的，索引是**累积**的，所以每条只处理新的那一条。索引坏掉只记账，
+   * 绝不打断事件流——观测不得反噬。
+   */
+  private noteReadCall(session: SessionView, event: { data?: unknown }): void {
+    try {
+      const data = event.data as { name?: unknown; arguments?: unknown } | undefined
+      if (typeof data?.name !== 'string' || typeof data.arguments !== 'string') return
+      noteToolCall(this.readIndexOf(session), data.name, data.arguments)
+    } catch (error: unknown) {
+      trace({
+        phase: 'ref-unread-skipped',
+        session: sessionTagOf(session),
+        note: '读取索引更新失败（不影响压缩）：' + errorChain(error),
+      })
+    }
+  }
+
+  /**
+   * 观测一：找出「对某路径下了否定判断、而本会话没读过它内容」的句子，逐条记账。
+   *
+   * 只记账不提醒，理由：这是新判据，误报率还没有一手数据。按 2026-11-15 定下的规矩，
+   * 误报 >30% 的东西不许进版面——先跑一段看它到底抓了什么。
+   * @param session - 会话视图
+   * @param text - 本条助手消息的**文本块**（不含思考与工具参数）
+   */
+  private reportUnbackedNegatives(session: SessionView, text: string): void {
+    if (text === '') return
+    try {
+      const claims = findUnbackedNegatives(text, this.readIndexOf(session))
+      for (const claim of claims.slice(0, MAX_REPORTS_PER_MESSAGE)) {
+        trace({
+          phase: 'unbacked-negative',
+          session: sessionTagOf(session),
+          note: claim.path + ' ← ' + claim.sentence.slice(0, 160),
+        })
+      }
+    } catch (error: unknown) {
+      trace({
+        phase: 'ref-unread-skipped',
+        session: sessionTagOf(session),
+        note: '无据否定侦测失败（不影响压缩）：' + errorChain(error),
+      })
+    }
+  }
+
+  /**
+   * 观测二：块里点了名的路径，本会话读过了没有；确证没读的，当场提醒。
+   *
+   * 只报「确证」那一档（`confirmed`）：路径写法明确、本会话没读过内容、**且文件真的存在**。
+   * 存在性这一刀能砍掉一大批误报——不存在的路径多半是我在假设或在举例。
+   *
+   * 提醒只是清单，不是判决：机器分不清「提到」和「引用」，所以最后一步永远是人看。
+   * @param session - 会话视图
+   * @param seq - 承载块的助手消息 seq（提醒按它去重）
+   * @param body - 块正文
+   */
+  private reconcileBlock(session: SessionView, seq: number, body: string): void {
+    let confirmed: ReturnType<typeof confirmedOnly>
+    try {
+      const index = this.readIndexOf(session)
+      // `cwd()` 给相对路径用。取不到就只能把相对路径判成「分不清」——`exists` 返回
+      // false 会让它们落到 suspected，而不是被误确证。
+      const cwd = index.cwd()
+      const refs = reconcileReferences(body, {
+        index,
+        // 只认「存在且是文件」。目录不算——把目录确证成人该看的清单，是这个功能最不该犯的错。
+        exists: (pathish: string) => {
+          const absolute = isAbsolute(pathish) ? pathish : (cwd === undefined ? '' : resolve(cwd, pathish))
+          if (absolute === '') return false
+          try {
+            return statSync(absolute).isFile()
+          } catch {
+            return false
+          }
+        },
+      })
+      confirmed = confirmedOnly(refs)
+    } catch (error: unknown) {
+      trace({
+        phase: 'ref-unread-skipped',
+        session: sessionTagOf(session),
+        seqFloor: seq,
+        note: '引用对账失败（不影响压缩）：' + errorChain(error),
+      })
+      return
+    }
+    if (confirmed.length === 0) return
+    trace({
+      phase: 'ref-unread',
+      session: sessionTagOf(session),
+      seqFloor: seq,
+      note: '确证 ' + String(confirmed.length) + ' 条未读：' + confirmed.map(ref => ref.path).join('，'),
+    })
+    this.notifyOnce(session, seq, [
+      '⚠ 这一块里点了名的路径，本会话没打开过它们（确证 ' + String(confirmed.length) + ' 条）：',
+      ...confirmed.slice(0, MAX_REPORTS_PER_MESSAGE).map(ref => '- ' + ref.path),
+      '',
+      '这是清单，不是判决。要麼现在去读，要麼在块里把话改成「我没查」。',
+    ].join('\n'))
   }
 
   /**
