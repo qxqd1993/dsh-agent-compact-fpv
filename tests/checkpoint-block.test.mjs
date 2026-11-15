@@ -5,7 +5,8 @@
  * 漏判只让本次压缩不发生（可重来）。⇒ 每一层护栏都要有**尸体样本**证明它会拦。
  *
  * 本文件按「护栏 → 尸体样本」组织：护栏一（哨兵行）、护栏二（围栏内视为引用）、
- * 护栏三（外壳配对）、护栏四（长度地板）、护栏五（section 按序全在）。
+ * 护栏三（外壳配对）、护栏四（长度地板）、护栏五（section 按序全在）、
+ * 护栏五+（self 六格结构与格内非空白）。
  *
  * 运行：npm test（先 build 再 node --test）
  */
@@ -14,8 +15,10 @@ import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   BEST_CANDIDATE_MARKER,
+  CHECKPOINT_CONTRACTS,
   CHECKPOINT_SECTIONS,
   CHECKPOINT_SENTINEL,
+  buildRejectionNotice,
   diagnoseBestCandidate,
   isInsideFence,
   parseCheckpointBlock,
@@ -31,6 +34,28 @@ const body = (extra = '') => CHECKPOINT_SECTIONS
 
 /** 规范块：哨兵 + 外壳 + 正文 */
 const block = (text = body()) => CHECKPOINT_SENTINEL + '\n' + formatCheckpointBlock(text)
+
+// self 契约的六格（与 CHECKPOINT_CONTRACTS 里的清单互为校验：一处改了、另一处没改就会红）
+const SELF_SENTINEL = '<!-- self-compact -->'
+const SELF_SECTIONS = ['## 此刻', '## 近來', '## 回響', '## 這一輪我吃了什麼虧', '## 我沒查的', '## 沉澱']
+
+/**
+ * 造一份六格中文正文。
+ * - `omit`：摘掉某几格，模拟「缺格」
+ * - `set`：覆盖某格内容；空串 = 写成空白，模拟「格在但一个字没写」
+ */
+const selfBody = ({ omit = [], set = {} } = {}) => SELF_SECTIONS
+  .filter(section => !omit.includes(section))
+  .map((section, index) => {
+    const content = set[section] !== undefined
+      ? set[section]
+      : '- 第' + String(index) + '格内容' + 'x'.repeat(50)
+    return section + '\n' + content
+  })
+  .join('\n\n')
+
+/** self 规范块：哨兵 + 外壳 + 正文 */
+const selfBlock = (text = selfBody()) => SELF_SENTINEL + '\n' + formatCheckpointBlock(text)
 
 describe('parseCheckpointBlock · 正路径', () => {
   test('规范块 → valid，正文剥壳后原样返回', () => {
@@ -163,6 +188,90 @@ describe('护栏五 · section 按序全在', () => {
       !parsed.reason.includes('近似命中'),
       '缺失那节的正文里没有近似行，报了就是恒亮——恒亮的提示等于噪音',
     )
+  })
+})
+
+/**
+ * self 契约从四格扩到六格：新增「這一輪我吃了什麼虧」（管**错**）与
+ * 「我沒查的」（管**空**）。两格的共同点是**最容易被写空**——亏损不想认、
+ * 没查的不想列。故除了「缺格」之外还钉一层「格内非空白」：
+ * 空着等于省略，省略等于假装没有；「無」「這一輪沒有」才是明确交代。
+ */
+describe('护栏五+ · 六格结构与格内内容（self 契约）', () => {
+  test('六格俱全 → valid，且契约表里的清单与六格一致', () => {
+    const parsed = parseCheckpointBlock(selfBlock(), MIN)
+    assert.equal(parsed.kind, 'valid')
+    assert.equal(parsed.contract, 'self')
+    for (const section of SELF_SECTIONS) {
+      assert.ok(parsed.body.includes(section), '正文应含 ' + section)
+    }
+    const self = CHECKPOINT_CONTRACTS.find(contract => contract.id === 'self')
+    assert.deepEqual([...self.sections], SELF_SECTIONS, '契约表必须与新格式同步')
+  })
+
+  test('尸体样本：只贴六格规范外壳（无哨兵）→ absent，模板本身绝不触发压缩', () => {
+    // 陷阱一：`formatCheckpointBlock` 的产物刻意不含哨兵。六格模板也一样——
+    // 引用者原样粘贴只能得到普通文本，要真压缩必须自己补首行哨兵。
+    const parsed = parseCheckpointBlock(formatCheckpointBlock(selfBody()), MIN)
+    assert.equal(parsed.kind, 'absent')
+  })
+
+  test('尸体样本：缺「我沒查的」→ invalid，告知具名指出缺的是哪一格', () => {
+    const parsed = parseCheckpointBlock(selfBlock(selfBody({ omit: ['## 我沒查的'] })), MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.equal(parsed.contract, 'self')
+    assert.match(parsed.reason, /缺少 section/)
+    assert.match(parsed.reason, /## 我沒查的/)
+    // 通知里既有「全部六格」的写法提示，也有「原因」行点名缺格；后者才是诊断。
+    const notice = buildRejectionNotice(parsed, MIN)
+    assert.match(notice, /缺少 section[^\n]*## 我沒查的/)
+  })
+
+  test('尸体样本：缺「這一輪我吃了什麼虧」→ invalid，告知具名指出缺的是哪一格', () => {
+    const parsed = parseCheckpointBlock(selfBlock(selfBody({ omit: ['## 這一輪我吃了什麼虧'] })), MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.equal(parsed.contract, 'self')
+    assert.match(parsed.reason, /缺少 section/)
+    assert.match(parsed.reason, /## 這一輪我吃了什麼虧/)
+    const notice = buildRejectionNotice(parsed, MIN)
+    assert.match(notice, /缺少 section[^\n]*## 這一輪我吃了什麼虧/)
+  })
+
+  test('尸体样本：两格皆缺 → 告知同时列出两格（不能只报第一格就停）', () => {
+    const parsed = parseCheckpointBlock(
+      selfBlock(selfBody({ omit: ['## 這一輪我吃了什麼虧', '## 我沒查的'] })),
+      MIN,
+    )
+    assert.equal(parsed.kind, 'invalid')
+    assert.match(parsed.reason, /缺少 section/)
+    const notice = buildRejectionNotice(parsed, MIN)
+    assert.match(notice, /缺少 section[^\n]*## 這一輪我吃了什麼虧[^\n]*## 我沒查的/)
+  })
+
+  test('尸体样本：沉澱不在最后（与我沒查的对调）→ invalid（顺序也要管）', () => {
+    // 原引擎就是**按序**找 section（indexOf + scanFrom）；这里钉住新格序，
+    // 防止「只查六格在不在」的退化——那样沉澱提前也算过关。
+    const shuffled = ['## 此刻', '## 近來', '## 回響', '## 這一輪我吃了什麼虧', '## 沉澱', '## 我沒查的']
+      .map(section => section + '\n- ' + 'x'.repeat(50))
+      .join('\n\n')
+    const parsed = parseCheckpointBlock(selfBlock(shuffled), MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.match(parsed.reason, /缺少 section/)
+    assert.match(parsed.reason, /## 沉澱/, '沉澱被提前后，按序查找会在它之后找不到它')
+  })
+
+  test('「我沒查的」写「無」→ valid（空不是缺：明确写没有也是内容）', () => {
+    const parsed = parseCheckpointBlock(selfBlock(selfBody({ set: { '## 我沒查的': '無' } })), MIN)
+    assert.equal(parsed.kind, 'valid')
+    assert.equal(parsed.contract, 'self')
+  })
+
+  test('尸体样本：「我沒查的」写成空白 → invalid（标题在但一个字没写 = 省略）', () => {
+    const parsed = parseCheckpointBlock(selfBlock(selfBody({ set: { '## 我沒查的': '' } })), MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.equal(parsed.contract, 'self')
+    assert.match(parsed.reason, /没有内容/)
+    assert.match(parsed.reason, /## 我沒查的/)
   })
 })
 

@@ -38,7 +38,7 @@ const MIN = 200
 
 const SELF_SENTINEL = '<!-- self-compact -->'
 const HANDOFF_SENTINEL = '<!-- handoff-compact -->'
-const SELF_SECTIONS = ['## 此刻', '## 近來', '## 回響', '## 沉澱']
+const SELF_SECTIONS = ['## 此刻', '## 近來', '## 回響', '## 這一輪我吃了什麼虧', '## 我沒查的', '## 沉澱']
 const HANDOFF_SECTIONS = [
   '## Primary Request and Intent',
   '## Key Technical Concepts',
@@ -51,11 +51,15 @@ const HANDOFF_SECTIONS = [
 ]
 
 /**
- * 按指定总长度造一份四格中文正文（section 按序、无首尾空白，长度等于 `length`）。
+ * 按指定总长度造一份**六格**中文正文（section 按序、无首尾空白，长度等于 `length`）。
  * 长度用填充行补齐，因此 199/201 这类边界是**精确**的。
+ *
+ * 2026-11-15：self 契约由四格变六格，并新增「标题到下一格之间 trim 后为空 ⇒ 不合法」。
+ * 所以填充不能再整条堆在最后一格——那样中间两格是空的，201 字符那条正样本会红。
+ * 现在每格先放一行占位，余数补进最后一格，长度仍然精确。
  */
-const selfBody = (length = 260) => {
-  const base = SELF_SECTIONS.join('\n')
+const selfBody = (length = 320) => {
+  const base = SELF_SECTIONS.map((head, index) => head + '\n占位' + String(index + 1)).join('\n')
   return base + '\n' + 'x'.repeat(Math.max(1, length - base.length - 1))
 }
 

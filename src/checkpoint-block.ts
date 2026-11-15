@@ -19,9 +19,10 @@ export const CHECKPOINT_CLOSE_TAG = '</compacted-summary>'
  *
  * 为什么要分契约而不是把中文标题并进同一张清单：`self` 与 `handoff` 是**两种互不
  * 兼容的语义**——前者是有连续自我的 agent 按认知距离分层写下的自述（此刻 / 近來 /
- * 回響 / 沉澱），后者是工具型 agent 的任务交接清单。若混成一张清单，一个只写了四格
- * 中文自述的块会被「缺八节英文」拒掉，一个只写了八格英文交接的块也会被「缺四格中文」
- * 拒掉；而若只查「至少命中某一套」，则两种半截块都能过关。⇒ 契约必须整体二选一。
+ * 回響 / 這一輪我吃了什麼虧 / 我沒查的 / 沉澱），后者是工具型 agent 的任务交接清单。
+ * 若混成一张清单，一个只写了六格中文自述的块会被「缺八节英文」拒掉，一个只写了
+ * 八格英文交接的块也会被「缺六格中文」拒掉；而若只查「至少命中某一套」，则两种
+ * 半截块都能过关。⇒ 契约必须整体二选一。
  */
 export interface CheckpointContract {
   readonly id: 'self' | 'handoff'
@@ -35,7 +36,10 @@ export const CHECKPOINT_CONTRACTS: readonly CheckpointContract[] = [
   {
     id: 'self',
     sentinel: '<!-- self-compact -->',
-    sections: ['## 此刻', '## 近來', '## 回響', '## 沉澱'],
+    // 六格按**认知距离**排序：正在做的 → 最近发生的 → 不会自己冒出来的 →
+    // 这一轮的亏损 → 这一轮的空白 → 更早的结论。后两格（亏 / 空）刻意放在
+    // 沉澱之前：它们是**这一轮**的清算，沉澱是更早的、不需要展开的东西。
+    sections: ['## 此刻', '## 近來', '## 回響', '## 這一輪我吃了什麼虧', '## 我沒查的', '## 沉澱'],
     minChars: 200,
   },
   {
@@ -207,7 +211,13 @@ export function diagnoseBestCandidate(body: string): { present: boolean; hint: s
  * 3. 哨兵之后（可隔空行）紧跟 `<compacted-summary>`
  * 4. 存在配对的 `</compacted-summary>`
  * 5. 正文长度 ≥ `Math.max(contract.minChars, minChars)`（全局下限只抬不降）
- * 6. 正文按序含该契约的全部 `sections`
+ * 6. 正文按序含该契约的全部 `sections`；`self` 契约还要求**每格都有内容**（空白不算；「無」算）
+ *
+ * 第 6 条只查**结构**（在不在、序对不对、格内是否空白），不判断内容真假：
+ * 「这一轮没有」「無」都是合法内容，引擎不替人审计陈述。格式要检查，内容不自动判断。
+ * 格内非空白这条**只加在 self 契约**上：六格里的「亏 / 空」必须明确写出「没有」，
+ * 空白标题等于省略。handoff 的八格语义与既有消费者不动——收紧它会改变上游行为，
+ * 那不是这次加格要付的代价。
  *
  * @param text - 助手消息的全部文本块（已拼接）
  * @param minChars - 全局长度下限：与契约自己的地板取较大者（配置只能收紧，不能放宽）
@@ -300,6 +310,8 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
   }
 
   const missing: string[] = []
+  // 记下每个 section 标题的起点：格内「有没有内容」要靠它与下一格起点切出区间。
+  const positions: number[] = []
   let scanFrom = 0
   for (const section of contract.sections) {
     const found = body.indexOf(section, scanFrom)
@@ -307,6 +319,7 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
       missing.push(section)
       continue
     }
+    positions.push(found)
     scanFrom = found + section.length
   }
   if (missing.length > 0) {
@@ -320,6 +333,32 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
     }
   }
 
+  // 结构完整性还有一层：标题在、顺序对，但标题底下**一个字都没有**。
+  // 为什么空白要和「缺格」一样拒：新加的两格（亏 / 空）最容易被写成空标题——
+  // 「我沒查的」空着等于省略，省略等于假装没有；「這一輪我吃了什麼虧」空着则
+  // 让读者无法区分「没吃亏」与「没写」。所以判据是**格内非空白**：
+  // 写「無」「這一輪沒有」是内容（明确说没有），空白不是。
+  // ⚠ 只判空白，不判真假——引擎没有能力也不应该审计「你说的亏是不是真的」。
+  // ⚠ 只作用于 self 契约：这是六格新增的规矩；handoff 八格维持原判据，
+  //    否则会顺手改掉上游既有行为（并让只用标题占位的旧测试全红）。
+  const empty: string[] = []
+  if (contract.id === 'self') {
+    for (let index = 0; index < contract.sections.length; index += 1) {
+      const section = contract.sections[index]!
+      const contentStart = positions[index]! + section.length
+      const contentEnd = index + 1 < contract.sections.length ? positions[index + 1]! : body.length
+      if (body.slice(contentStart, contentEnd).trim() === '') empty.push(section)
+    }
+  }
+  if (empty.length > 0) {
+    return {
+      kind: 'invalid',
+      contract: contract.id,
+      reason: 'section 内没有内容（空白不算；「無」也算写了）：' + empty.join(' / '),
+      chars: body.length,
+    }
+  }
+
   return { kind: 'valid', body, chars: body.length, contract: contract.id }
 }
 
@@ -328,6 +367,9 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
  *
  * 它刻意**不含**哨兵——引用者若原样粘贴，识别器只会看到外壳标签而判 `absent`
  * （没有哨兵就不是意图）；要真的压缩，必须显式补上哨兵那一行。
+ *
+ * 六格模板见 `self/CHECKPOINT.md`：本函数只包壳，不持有 section 清单
+ * （识别侧的清单在 `CHECKPOINT_CONTRACTS`），所以加格不改变这里的输出形状。
  * @param body - 摘要正文
  * @returns 带外壳的块文本
  */
@@ -354,7 +396,7 @@ function contractPrompt(contract: CheckpointContract, minChars: number): string 
  * 构造「这次 checkpoint 未生效」的可见通知（纯函数，便于离线断言文案）。
  *
  * 按 `parsed.contract` 分派：`self` 失败绝不能叫人补八格英文，`handoff` 失败也不能
- * 叫人补四格中文——写错契约的正文再长也过不了另一套的 section 校验。判不出契约
+ * 叫人补六格中文——写错契约的正文再长也过不了另一套的 section 校验。判不出契约
  * （两条哨兵同时出现）时**不替人挑**：并排列出两张写法，让人自己选。
  *
  * @param parsed - 识别结论（`absent` 之外：调用点是「有哨兵但不合法」）
@@ -381,7 +423,7 @@ export function buildRejectionNotice(
   }
 
   const contract = CHECKPOINT_CONTRACTS.find(item => item.id === parsed.contract)!
-  const kind = contract.id === 'self' ? 'self 契约（四格中文自述）' : 'handoff 契约（八格英文交接清单）'
+  const kind = contract.id === 'self' ? 'self 契约（六格中文自述）' : 'handoff 契约（八格英文交接清单）'
   return [
     head,
     '要压缩请重发一块 ' + kind + '：首行' + contractPrompt(contract, minChars) + '，',
