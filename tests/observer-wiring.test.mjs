@@ -36,9 +36,12 @@ after(() => {
 
 /** 六格俱全的合法正文（新契約；缺一格就不合法，這份測試不想順帶驗格式）。 */
 const SECTIONS = ['## 此刻', '## 近來', '## 回響', '## 這一輪我吃了什麼虧', '## 我沒查的', '## 沉澱']
+// 尾巴那串必须够长：引擎有 200 字符的硬地板（`minCheckpointChars` 只能往上抬，不能往下压），
+// 而 2026-11-15 之前这里只有 20 个字符 ⇒ 正文 122 字符、被判 invalid，
+// 「读过的路径不提醒」那个用例其实是靠「块无效」通过的，从没走到对账。
 const bodyWith = (extra) =>
   SECTIONS.map((head, index) => head + '\n占位' + String(index + 1) + (index === 0 ? '\n' + extra : '')).join('\n')
-  + '\n' + 'x'.repeat(20)
+  + '\n' + 'x'.repeat(200)
 
 /** 桩上下文：收下监听器，不实现 cordis 的任何语义。 */
 function harness() {
@@ -147,6 +150,14 @@ test('块里引用的路径如果本会话读过 → 不提醒', () => {
   })
   assert.equal(h.lines().filter(e => e.phase === 'ref-unread').length, 0)
   assert.equal(h.sends.length, 0)
+  // 「没提醒」有两种：对过账、都干净，或者对账根本没跑。留一笔 ref-clean 才能分开——
+  // 否则侧车里的沉默和没跑过是同一个样子（2026-11-15 实测那块裸相对路径的块正是如此）。
+  const clean = h.lines().filter(e => e.phase === 'ref-clean')
+  assert.equal(clean.length, 1, '对过账但零确证时必须留 ref-clean')
+  // 「读过就放行」这条判据排在所有分档之前，所以读过的路径连候选都不算 ⇒ 候选 0 条。
+  assert.match(String(clean[0].note), /没有确证未读/)
+  assert.match(String(clean[0].note), /候选 0 条/)
+  assert.match(String(clean[0].note), /确证 0/)
 })
 
 test('不合法的块不做对账（不会成为断口材料，对它是给废纸做校对）', () => {
@@ -158,4 +169,6 @@ test('不合法的块不做对账（不会成为断口材料，对它是给废�
   })
   assert.equal(h.lines().filter(e => e.phase === 'ref-unread').length, 0)
   assert.equal(h.sends.length, 0)
+  // 反向：不合法的块**连 ref-clean 都不该有**——这正好把「对过账、干净」和「没对账」分开。
+  assert.equal(h.lines().filter(e => e.phase === 'ref-clean').length, 0)
 })

@@ -456,6 +456,7 @@ export class AgentCompactEngine {
    */
   private reconcileBlock(session: SessionView, seq: number, body: string): void {
     let confirmed: ReturnType<typeof confirmedOnly>
+    let summary = ''
     try {
       const index = this.readIndexOf(session)
       // `cwd()` 给相对路径用。取不到就只能把相对路径判成「分不清」——`exists` 返回
@@ -475,6 +476,11 @@ export class AgentCompactEngine {
         },
       })
       confirmed = confirmedOnly(refs)
+      // 留成分账：候选择了几条、各档几条。零命中时它解释「为什么安静」——
+      // 是候选都没认出来，还是认出来了但全是裸相对路径（永远到不了确证档）。
+      const ofTier = (tier: string): number => refs.filter(ref => ref.tier === tier).length
+      summary = '候选 ' + String(refs.length) + ' 条（确证 ' + String(confirmed.length)
+        + '，分不清 ' + String(ofTier('suspected')) + '，噪声 ' + String(ofTier('noise')) + '）'
     } catch (error: unknown) {
       trace({
         phase: 'ref-unread-skipped',
@@ -484,7 +490,15 @@ export class AgentCompactEngine {
       })
       return
     }
-    if (confirmed.length === 0) return
+    if (confirmed.length === 0) {
+      trace({
+        phase: 'ref-clean',
+        session: sessionTagOf(session),
+        seqFloor: seq,
+        note: '没有确证未读：' + summary,
+      })
+      return
+    }
     trace({
       phase: 'ref-unread',
       session: sessionTagOf(session),
